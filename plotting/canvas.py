@@ -83,6 +83,14 @@ class PGCanvas(pg.GraphicsLayoutWidget):
         pt = vb.mapSceneToView(event.scenePos())
         self.sigDataClicked.emit(pt.x(), pt.y(), event.button())
 
+    def set_welcome(self, msg):
+        """Show a welcome/placeholder message, replacing whatever the canvas
+        was constructed with — used by tabs that share one canvas across
+        multiple modes (e.g. a "File type" switch) to give a mode-appropriate
+        placeholder instead of the one fixed at __init__ time."""
+        self._welcome_msg = msg
+        self._welcome()
+
     def _welcome(self):
         ax = self.reset_axes()
         ax.hideAxis("bottom")

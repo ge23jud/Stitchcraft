@@ -70,6 +70,7 @@ def _new_nanowire():
         start_conditions=None,  # (3, n_peaks): [peakindex, fitwindow_pts, maxsignal_idx]
         n_sel_peaks=0,
         fit_model=None,
+        background_type=None,
         # Fit results  (lists of lists, [peak_idx][power_idx])
         fits=None,
         fit_data=None,          # each entry: ndarray (N, 3) = [X, Y, bg]
@@ -959,6 +960,7 @@ def fit_nw(nw, subtract_fit_background='none', fitfunction='gauss1',
     nw.fwhm            = fwhm_cell
     nw.fwhm_err        = fwhm_err_cell
     nw.fit_model       = fitfunction
+    nw.background_type = subtract_fit_background
 
     # Total peak area per power step
     total = np.zeros(n_powers)

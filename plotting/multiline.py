@@ -78,7 +78,8 @@ class MultiLinePlotter:
         default is antialiased, which combined with a non-default pen width
         forces PyQtGraph's slow per-segment rendering path; fine for the
         few-thousand-point curves every other tab plots, but not for e.g. a
-        65536-sample TRPL histogram (see tabs/convert.py)."""
+        65536-sample TRPL histogram (see tabs/stitch.py's TRPL-conversion
+        mode)."""
         color, alpha = self._scheme.resolve(index=index, value=value)
         pen = pg.mkPen(color=color, width=width)
         kwargs = {} if antialias is None else {"antialias": antialias}

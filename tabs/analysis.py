@@ -1380,7 +1380,12 @@ class AnalysisTab(QWidget):
                 grp = f.create_group("analysis")
 
                 # ── Metadata attributes ───────────────────────────
-                fit_fn = getattr(nw, "fit_function", "gaussian") or "gaussian"
+                # nw.fit_model (not "fit_function") is the real attribute set
+                # by nw_analysis.fit_nw() — reading the wrong name here meant
+                # this always silently saved "gaussian" regardless of which
+                # fit function was actually used; same bug for background_type
+                # below (nw_analysis.fit_nw() now sets it too, see 2026-08 fix).
+                fit_fn = getattr(nw, "fit_model", "gauss1") or "gauss1"
                 grp.attrs["FitFunction"] = fit_fn
                 bg_type = getattr(nw, "background_type", "linear") or "linear"
                 grp.attrs["FitBackground"] = bg_type
@@ -1512,10 +1517,20 @@ class AnalysisTab(QWidget):
                     except Exception:
                         pass
 
-                # ── BackgroundData: (n_peaks, n_powers, n_datapoints) ──
-                # Named "BackgroundData", not "FitBackground", to avoid
-                # colliding with the group-level "FitBackground" attribute
-                # (the background-subtraction mode string, e.g. "linear").
+                # ── FitWindowX / FitWindowRawY / BackgroundData: (n_peaks, n_powers, n_datapoints) ──
+                # fit_data[j][i] holds 3 columns per (peak, power step): the
+                # window's x-positions (nm), the background-subtracted y used
+                # for fitting, and the local background curve. All 3 are
+                # saved (not just the background, as before 2026-08) so an
+                # external reader — e.g. the Visualizer tab's Inspect peaks,
+                # which has no access to this session's live `nw` object —
+                # can replicate this tab's Inspect-fits overlay exactly:
+                # FitWindowX + FitWindowRawY draw the highlighted windowed
+                # data, FitWindowX + BackgroundData + FitParameters draw the
+                # fitted curve with its background added back. Named
+                # "BackgroundData", not "FitBackground", to avoid colliding
+                # with the group-level "FitBackground" attribute (the
+                # background-subtraction mode string, e.g. "linear").
                 fit_data = getattr(nw, "fit_data", None)
                 if fit_data is not None:
                     try:
@@ -1528,14 +1543,28 @@ class AnalysisTab(QWidget):
                                     if arr.shape[1] >= 3:
                                         n_pts = max(n_pts, arr.shape[0])
                         if n_pts > 0:
-                            bg_arr = np.full((n_pk, n_pw, n_pts), np.nan)
+                            x_arr   = np.full((n_pk, n_pw, n_pts), np.nan)
+                            rawy_arr = np.full((n_pk, n_pw, n_pts), np.nan)
+                            bg_arr  = np.full((n_pk, n_pw, n_pts), np.nan)
                             for j, peak_data in enumerate(fit_data):
                                 for i, data_arr in enumerate(peak_data):
                                     if data_arr is not None:
                                         arr = np.atleast_2d(data_arr)
                                         if arr.shape[1] >= 3:
-                                            bg_col = arr[:, 2]
-                                            bg_arr[j, i, :len(bg_col)] = bg_col
+                                            n = arr.shape[0]
+                                            x_arr[j, i, :n]    = arr[:, 0]
+                                            rawy_arr[j, i, :n] = arr[:, 1] + arr[:, 2]
+                                            bg_arr[j, i, :n]   = arr[:, 2]
+                            ds = grp.create_dataset("FitWindowX", data=x_arr)
+                            ds.attrs["units"] = "nm"
+                            ds.attrs["description"] = (
+                                "peaks x powers x datapoints: fit window x-positions"
+                            )
+                            ds = grp.create_dataset("FitWindowRawY", data=rawy_arr)
+                            ds.attrs["description"] = (
+                                "peaks x powers x datapoints: raw (background-included) "
+                                "counts in the fit window"
+                            )
                             ds = grp.create_dataset("BackgroundData", data=bg_arr)
                             ds.attrs["description"] = (
                                 "peaks x powers x datapoints: local background curve "
