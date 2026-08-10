@@ -32,6 +32,7 @@ class SpotsizeTab(QWidget):
         # ── Spotsize state ────────────────────────────────────────
         self._ss_x            = None
         self._ss_deriv        = None
+        self._ss_deriv_raw    = None           # derivative before sign flip
         self._ss_spans        = [None, None]
         self._ss_span_widgets = [None, None]   # DraggableSpan instances
 
@@ -57,6 +58,9 @@ class SpotsizeTab(QWidget):
         fl.addWidget(btn_load)
         self._ss_is_deriv = QCheckBox("Column 2 is already a derivative")
         fl.addWidget(self._ss_is_deriv)
+        self._ss_reverse_sign = QCheckBox("Reverse derivative sign")
+        self._ss_reverse_sign.stateChanged.connect(self._ss_on_reverse_sign)
+        fl.addWidget(self._ss_reverse_sign)
         sl.addWidget(g_file)
 
         g_par = QGroupBox("Parameters")
@@ -127,6 +131,18 @@ class SpotsizeTab(QWidget):
         layout.addWidget(right, stretch=1)
 
     # ── Spotsize: helpers ─────────────────────────────────────────
+
+    def _ss_signed_deriv(self):
+        if self._ss_deriv_raw is None:
+            return None
+        return -self._ss_deriv_raw if self._ss_reverse_sign.isChecked() else self._ss_deriv_raw
+
+    def _ss_on_reverse_sign(self):
+        if self._ss_deriv_raw is None:
+            return
+        self._ss_deriv = self._ss_signed_deriv()
+        self._ss_result_lbl.setText("")
+        self._ss_setup_canvas()
 
     def _ss_default_span_ranges(self):
         """Initial (draggable, not-yet-committed) span positions shown when
@@ -203,8 +219,9 @@ class SpotsizeTab(QWidget):
                                  f"Could not read:\n{path}\n\n{exc}")
             return
 
-        self._ss_x     = x
-        self._ss_deriv = y if self._ss_is_deriv.isChecked() else np.gradient(y, x)
+        self._ss_x         = x
+        self._ss_deriv_raw = y if self._ss_is_deriv.isChecked() else np.gradient(y, x)
+        self._ss_deriv     = self._ss_signed_deriv()
         self._ss_spans = [None, None]
         self._ss_span1_lbl.setText("Span 1: not set")
         self._ss_span2_lbl.setText("Span 2: not set")

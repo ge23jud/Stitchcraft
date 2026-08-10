@@ -2,9 +2,10 @@ import os
 import sys
 import numpy as np
 import h5py
+import pyqtgraph as pg
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QLabel,
-    QPushButton, QRadioButton, QListWidget, QListWidgetItem,
+    QPushButton, QRadioButton, QCheckBox, QListWidget, QListWidgetItem,
     QFileDialog, QMessageBox, QAbstractItemView, QFrame, QDialog,
 )
 from PyQt5.QtGui import QFont
@@ -12,7 +13,7 @@ from PyQt5.QtGui import QFont
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from plotting import (
     PGCanvas, _COMPACT_BTN_STYLE, MultiLinePlotter, CategoricalScheme,
-    SequentialScheme, LogAlphaRamp, PLASMA, make_pg_toolbar,
+    SequentialScheme, LogAlphaRamp, PLASMA, TAB10, make_pg_toolbar,
 )
 from io_utils import _h5_contents_summary
 
@@ -61,6 +62,14 @@ class VisualizerTab(QWidget):
         g_files.setStyleSheet(_COMPACT_BTN_STYLE)
         sl.addWidget(g_files, stretch=1)
 
+        # Thresholds group — shows analysis/Threshold, per loaded file, if present
+        g_thr = QGroupBox("Thresholds")
+        thl = QVBoxLayout(g_thr)
+        self._vis_thr_lbl = QLabel("No files loaded.")
+        self._vis_thr_lbl.setWordWrap(True)
+        thl.addWidget(self._vis_thr_lbl)
+        sl.addWidget(g_thr)
+
         # Legend quantity group
         g_qty = QGroupBox("Legend quantity")
         ql = QVBoxLayout(g_qty)
@@ -78,6 +87,12 @@ class VisualizerTab(QWidget):
         self._vis_rb_qty_power.toggled.connect(lambda _: self._vis_plot())
         self._vis_rb_qty_density.toggled.connect(lambda _: self._vis_plot())
         self._vis_rb_qty_fluence.toggled.connect(lambda _: self._vis_plot())
+
+        self._vis_group_qty = g_qty
+
+        self._vis_chk_integrated = QCheckBox("Plot integrated spectrum vs pump fluence")
+        self._vis_chk_integrated.toggled.connect(self._vis_on_integrated_toggled)
+        sl.addWidget(self._vis_chk_integrated)
 
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
@@ -120,6 +135,7 @@ class VisualizerTab(QWidget):
                     item = QListWidgetItem(d["label"])
                     item.setToolTip(p)
                     self._vis_file_list.addItem(item)
+        self._vis_update_thresholds()
         self._vis_plot()
 
     def _vis_load_file(self, path: str):
@@ -162,15 +178,26 @@ class VisualizerTab(QWidget):
                         pump_fluence = pump_fluence * 1e-3   # old files: µJ → mJ
                 else:
                     pump_fluence = None
+
+                threshold = threshold_err = threshold_units = None
+                if "analysis" in f and "Threshold" in f["analysis"]:
+                    analysis_grp    = f["analysis"]
+                    threshold       = analysis_grp["Threshold"][:].astype(float)
+                    threshold_units = analysis_grp.attrs.get("ThresholdUnits", "mW")
+                    if "ThresholdErr" in analysis_grp:
+                        threshold_err = analysis_grp["ThresholdErr"][:].astype(float)
             return {
-                "label":         os.path.splitext(os.path.basename(path))[0],
-                "wl":            wl,
-                "counts":        counts,
-                "powers_W":      powers_W,
-                "power_cal":     power_cal,
-                "power_density": power_dens,
-                "pump_fluence":  pump_fluence,
-                "path":          path,
+                "label":           os.path.splitext(os.path.basename(path))[0],
+                "wl":              wl,
+                "counts":          counts,
+                "powers_W":        powers_W,
+                "power_cal":       power_cal,
+                "power_density":   power_dens,
+                "pump_fluence":    pump_fluence,
+                "threshold":       threshold,
+                "threshold_err":   threshold_err,
+                "threshold_units": threshold_units,
+                "path":            path,
             }
         except Exception as exc:
             QMessageBox.warning(self, "Load error",
@@ -187,13 +214,42 @@ class VisualizerTab(QWidget):
             self._vis_file_list.takeItem(row)
             self._vis_files.pop(row)
             self._vis_data.pop(row)
+        self._vis_update_thresholds()
         self._vis_plot()
 
     def _vis_on_clear(self):
         self._vis_files.clear()
         self._vis_data.clear()
         self._vis_file_list.clear()
+        self._vis_update_thresholds()
         self._vis_canvas._welcome()
+
+    def _vis_update_thresholds(self):
+        """Refresh the Thresholds panel from analysis/Threshold in each
+        loaded file, if present (written by the Analysis tab's Save)."""
+        if not self._vis_data:
+            self._vis_thr_lbl.setText("No files loaded.")
+            return
+
+        lines = []
+        for d in self._vis_data:
+            thr = d.get("threshold")
+            if thr is None:
+                lines.append(f"{d['label']}: —")
+                continue
+            units = d.get("threshold_units") or "mW"
+            err   = d.get("threshold_err")
+            parts = []
+            for i, val in enumerate(thr):
+                if np.isnan(val):
+                    continue
+                if err is not None and i < len(err) and not np.isnan(err[i]):
+                    parts.append(f"peak {i+1}: {val:.4g} ± {err[i]:.2g} {units}")
+                else:
+                    parts.append(f"peak {i+1}: {val:.4g} {units}")
+            lines.append(f"{d['label']}: " + ("; ".join(parts) if parts else "—"))
+
+        self._vis_thr_lbl.setText("\n".join(lines))
 
     def _vis_on_show_data(self):
         row = self._vis_file_list.currentRow()
@@ -255,8 +311,16 @@ class VisualizerTab(QWidget):
 
     # ── Visualizer: plot ─────────────────────────────────────────
 
+    def _vis_on_integrated_toggled(self, checked):
+        self._vis_group_qty.setEnabled(not checked)
+        self._vis_plot()
+
     def _vis_plot(self):
         if not self._vis_data:
+            return
+
+        if self._vis_chk_integrated.isChecked():
+            self._vis_plot_integrated()
             return
 
         n_files  = len(self._vis_data)
@@ -297,4 +361,47 @@ class VisualizerTab(QWidget):
         ax.setLabel("left", "Counts")
         ax.showGrid(x=True, y=True, alpha=0.3)
         ax.setTitle("PL spectra")
+        self._vis_canvas.draw_idle()
+
+    def _vis_plot_integrated(self):
+        ax = self._vis_canvas.reset_axes()
+        ax.addLegend(labelTextSize="7pt")
+        plotted = False
+
+        for fi, d in enumerate(self._vis_data):
+            fluence = d.get("pump_fluence")
+            if fluence is None:
+                continue
+            wl = d["wl"]
+            x  = _HC_EV_NM / wl
+            s  = np.argsort(x)
+            x_sorted = x[s]
+
+            n_powers   = d["counts"].shape[1]
+            integrated = np.array([
+                np.trapz(d["counts"][s, i], x_sorted) for i in range(n_powers)
+            ])
+
+            order = np.argsort(fluence)
+            color = TAB10[fi % 10]
+            ax.plot(fluence[order], integrated[order],
+                     pen=pg.mkPen(color, width=1.2),
+                     symbol="o", symbolSize=6, symbolBrush=color,
+                     name=d["label"])
+            plotted = True
+
+        if not plotted:
+            vb = ax.getViewBox()
+            vb.setRange(xRange=(0, 1), yRange=(0, 1), padding=0)
+            vb.setMouseEnabled(x=False, y=False)
+            text = pg.TextItem("No pump fluence data in loaded file(s).",
+                                color="#888888", anchor=(0.5, 0.5))
+            text.setPos(0.5, 0.5)
+            vb.addItem(text)
+        else:
+            ax.setLabel("bottom", "Pump fluence (mJ/cm²)")
+            ax.setLabel("left", "Integrated intensity (arb.u.)")
+            ax.showGrid(x=True, y=True, alpha=0.3)
+            ax.setTitle("Integrated PL intensity vs pump fluence")
+
         self._vis_canvas.draw_idle()

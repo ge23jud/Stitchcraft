@@ -633,7 +633,10 @@ def _stitch_counts(datasets_sorted, spans_wl):
     """Stitch counts matrices from sorted datasets at wavelength span boundaries.
 
     In each span the left file's wavelength grid is kept; the right file is
-    interpolated onto it and the two are averaged.
+    interpolated onto it. The two are combined with a linearly ramped weight
+    that goes from 1 (all left) at the low-wavelength edge of the span to 0
+    (all right) at the high-wavelength edge, in equal steps across the span's
+    measurement points.
 
     Returns (wl_out, counts_out) where counts_out is (n_wl, n_powers).
     """
@@ -662,13 +665,21 @@ def _stitch_counts(datasets_sorted, spans_wl):
             mask_span = (wl_i >= sp_lo) & (wl_i <= sp_hi)
             wl_span = wl_i[mask_span]
             c_left = c_i[mask_span]                              # (n_span, n_powers)
-            c_right = np.stack([                                 # interpolate right file
-                np.interp(wl_span, d_next["wl"], d_next["counts"][:, p])
-                for p in range(n_powers)
-            ], axis=1)                                           # (n_span, n_powers)
-            if len(wl_span) > 0:
+            n_span = len(wl_span)
+            if n_span > 0:
+                # Order by wavelength so the weight ramp runs from the span's
+                # low edge (left file, weight 1) to its high edge (right file,
+                # weight 0), regardless of the file's native point order.
+                order_span = np.argsort(wl_span)
+                wl_span = wl_span[order_span]
+                c_left = c_left[order_span]
+                c_right = np.stack([                             # interpolate right file
+                    np.interp(wl_span, d_next["wl"], d_next["counts"][:, p])
+                    for p in range(n_powers)
+                ], axis=1)                                       # (n_span, n_powers)
+                w_left = np.linspace(1.0, 0.0, n_span)[:, None]  # 1 → 0 across the span
                 wl_parts.append(wl_span)
-                counts_parts.append((c_left + c_right) / 2.0)
+                counts_parts.append(w_left * c_left + (1.0 - w_left) * c_right)
 
     wl_out = np.concatenate(wl_parts)
     counts_out = np.concatenate(counts_parts, axis=0)

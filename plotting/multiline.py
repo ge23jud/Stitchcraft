@@ -71,9 +71,17 @@ class MultiLinePlotter:
         self._plot_item = plot_item
         self._scheme = scheme
 
-    def plot(self, x, y, index=None, value=None, label=None, width=1.0):
+    def plot(self, x, y, index=None, value=None, label=None, width=1.0, antialias=None):
+        """antialias=None (default) inherits the global pg.setConfigOptions()
+        setting, matching prior behavior exactly. Pass antialias=False for
+        very large curves (tens of thousands of points+) — the app-wide
+        default is antialiased, which combined with a non-default pen width
+        forces PyQtGraph's slow per-segment rendering path; fine for the
+        few-thousand-point curves every other tab plots, but not for e.g. a
+        65536-sample TRPL histogram (see tabs/convert.py)."""
         color, alpha = self._scheme.resolve(index=index, value=value)
         pen = pg.mkPen(color=color, width=width)
-        item = self._plot_item.plot(x, y, pen=pen, name=label)
+        kwargs = {} if antialias is None else {"antialias": antialias}
+        item = self._plot_item.plot(x, y, pen=pen, name=label, **kwargs)
         item.setOpacity(alpha)
         return item

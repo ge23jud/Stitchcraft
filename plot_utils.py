@@ -1,11 +1,24 @@
 """Pure matplotlib figure-construction logic for the Plot tab — no Qt
 imports, mirroring sem_utils.py's UI-free convention.
 """
+import math
 import os
 
 import numpy as np
 from matplotlib import colormaps
 from matplotlib.figure import Figure
+
+
+def _legend_ncols(n_entries, fig_height_in, fontsize=8):
+    """Number of legend columns needed so a single-column legend (plus its
+    title) wouldn't need more vertical space than the figure has — which
+    otherwise makes constrained_layout shrink the axes to fit it, squeezing
+    the actual plot."""
+    row_in    = fontsize * 1.6 / 72.0   # ~ default matplotlib legend row height
+    title_in  = row_in                  # reserve one row's worth for the title
+    usable_in = max(fig_height_in - title_in, row_in)
+    max_rows  = max(1, int(usable_in / row_in))
+    return max(1, math.ceil(n_entries / max_rows))
 
 
 def build_spectrum_figure(data, figsize=(8, 5)):
@@ -44,8 +57,9 @@ def build_spectrum_figure(data, figsize=(8, 5)):
     ax.set_title(data["label"])
     ax.grid(True, alpha=0.3)
     legend_title = "Pump Fluence (uJ/cm²)" if not missing_fluence else "Power (no fluence in file)"
+    ncols = _legend_ncols(n_powers, figsize[1])
     ax.legend(title=legend_title, loc="upper left", bbox_to_anchor=(1.02, 1.0),
-              borderaxespad=0.0, fontsize=8, title_fontsize=8)
+              borderaxespad=0.0, fontsize=8, title_fontsize=8, ncol=ncols)
     return fig, missing_fluence
 
 

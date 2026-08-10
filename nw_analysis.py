@@ -770,7 +770,7 @@ def set_startconditions(nw, window_width, x_unit='eV',
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fit_nw(nw, subtract_fit_background='none', fitfunction='gauss1',
-           show_progress=False):
+           show_progress=False, fixed_window_below_index=None):
     """
     Fit peaks across all power steps.
 
@@ -781,10 +781,18 @@ def fit_nw(nw, subtract_fit_background='none', fitfunction='gauss1',
 
     Parameters
     ----------
-    nw                      : Nanowire
-    subtract_fit_background : 'linear', 'constant', 'none', or 'raw'
-    fitfunction             : 'gauss1'..'gauss4', 'lorentz1', 'lorentz<N>'
-    show_progress           : bool — show each fit in a figure
+    nw                        : Nanowire
+    subtract_fit_background   : 'linear', 'constant', 'none', or 'raw'
+    fitfunction               : 'gauss1'..'gauss4', 'lorentz1', 'lorentz<N>'
+    show_progress             : bool — show each fit in a figure
+    fixed_window_below_index  : int or None — 0-based power-step index
+        (spectra are ordered by ascending power, index 0 = lowest power).
+        Spectra with index < this value do NOT get their fit window
+        re-centered on the neighboring spectrum's fitted peak position;
+        instead the window is frozen at whatever position it had reached
+        right at this index and held constant for every lower-power step.
+        None (default) reproduces the original behavior: the window
+        tracks the fitted peak across the entire power series.
     """
     if nw.start_conditions is None or nw.n_sel_peaks == 0:
         print('fit_nw: run set_startconditions first.')
@@ -833,6 +841,17 @@ def fit_nw(nw, subtract_fit_background='none', fitfunction='gauss1',
 
         # Iteration order: start at max_spec_idx, go down then up
         order = list(range(max_spec_idx, -1, -1)) + list(range(max_spec_idx+1, n_powers))
+
+        def _seed_for(target_idx, tracked_val, current_val):
+            """Peak-index guess to seed `target_idx` with: the tracked
+            position from the just-processed neighbor, unless
+            fixed_window_below_index applies to `target_idx`, in which
+            case the window stays frozen at `current_val` instead of
+            following the tracked peak."""
+            if (fixed_window_below_index is not None
+                    and target_idx < fixed_window_below_index):
+                return current_val
+            return tracked_val
 
         for i in order:
             i1 = max(0,        peak_idx_arr[i] - fitwindow // 2)
@@ -902,13 +921,14 @@ def fit_nw(nw, subtract_fit_background='none', fitfunction='gauss1',
             new_pi = last_pi + peak_idx_arr[i] - fitwindow // 2
             new_pi = int(np.clip(new_pi, 0, n_wl - 1))
             if i > 0 and i <= max_spec_idx:
-                peak_idx_arr[i - 1] = new_pi
+                peak_idx_arr[i - 1] = _seed_for(i - 1, new_pi, peak_idx_arr[i])
             elif i > max_spec_idx and i + 1 < n_powers:
-                peak_idx_arr[i + 1] = new_pi
+                peak_idx_arr[i + 1] = _seed_for(i + 1, new_pi, peak_idx_arr[i])
             elif i == max_spec_idx and i + 1 < n_powers:
-                peak_idx_arr[i + 1] = (peak_idx_arr[max_spec_idx - 1]
-                                       if max_spec_idx > 0
-                                       else peak_idx_arr[max_spec_idx])
+                seed = (peak_idx_arr[max_spec_idx - 1]
+                        if max_spec_idx > 0
+                        else peak_idx_arr[max_spec_idx])
+                peak_idx_arr[i + 1] = _seed_for(i + 1, seed, peak_idx_arr[i])
 
             if show_progress and popt is not None:
                 ax_p[0].cla()

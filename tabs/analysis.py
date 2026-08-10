@@ -1,12 +1,14 @@
 import os
 import sys
+import re
+import math
 import numpy as np
 import h5py
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QLabel,
     QPushButton, QRadioButton, QComboBox, QCheckBox, QLineEdit,
     QFileDialog, QMessageBox, QSizePolicy, QScrollArea, QFrame,
-    QApplication,
+    QApplication, QDialog,
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
@@ -56,6 +58,10 @@ class AnalysisTab(QWidget):
         self._ana_thr_values   = None
         self._ana_thr_title    = ""
         self._ana_thr_scatter  = None
+        # inspect fits
+        self._ana_insp_peak      = 0
+        self._ana_insp_power_idx = 0
+        self._ana_insp_span      = None
 
         # ── Build UI (body of original _build_analysis_tab) ───────
         layout = QHBoxLayout(self)
@@ -91,40 +97,13 @@ class AnalysisTab(QWidget):
         gfl.addWidget(btn_load_ana)
         sl.addWidget(g_file)
 
+        btn_settings = QPushButton("⚙  Settings…")
+        btn_settings.clicked.connect(self._ana_open_settings)
+        sl.addWidget(btn_settings)
+
         # set_startconditions group
         g_sc = QGroupBox("1  Select peaks  (set_startconditions)")
         scl = QVBoxLayout(g_sc)
-
-        r_win = QHBoxLayout()
-        r_win.addWidget(QLabel("Window width:"))
-        self._ana_window_width = QLineEdit("0.05")
-        r_win.addWidget(self._ana_window_width)
-        scl.addLayout(r_win)
-
-        r_xu = QHBoxLayout()
-        r_xu.addWidget(QLabel("X unit:"))
-        self._ana_rb_ev = QRadioButton("eV")
-        self._ana_rb_nm = QRadioButton("nm")
-        self._ana_rb_ev.setChecked(True)
-        r_xu.addWidget(self._ana_rb_ev)
-        r_xu.addWidget(self._ana_rb_nm)
-        scl.addLayout(r_xu)
-
-        r_sel = QHBoxLayout()
-        r_sel.addWidget(QLabel("Spectrum:"))
-        self._ana_spectrum_sel = QComboBox()
-        self._ana_spectrum_sel.addItems(["last", "maxpeak", "maxsum"])
-        r_sel.addWidget(self._ana_spectrum_sel)
-        scl.addLayout(r_sel)
-
-        r_ys = QHBoxLayout()
-        r_ys.addWidget(QLabel("Y scale:"))
-        self._ana_rb_log = QRadioButton("log")
-        self._ana_rb_lin = QRadioButton("linear")
-        self._ana_rb_log.setChecked(True)
-        r_ys.addWidget(self._ana_rb_log)
-        r_ys.addWidget(self._ana_rb_lin)
-        scl.addLayout(r_ys)
 
         self._ana_btn_sc = QPushButton("1a  Click peaks in plot…")
         self._ana_btn_sc.setEnabled(False)
@@ -139,22 +118,6 @@ class AnalysisTab(QWidget):
         g_fit = QGroupBox("2  Fit peaks  (fit_nw)")
         fitl = QVBoxLayout(g_fit)
 
-        r_ff = QHBoxLayout()
-        r_ff.addWidget(QLabel("Function:"))
-        self._ana_fitfunc = QComboBox()
-        self._ana_fitfunc.addItems(
-            ["gauss1", "gauss2", "gauss3", "gauss4", "lorentz1", "lorentz2"]
-        )
-        r_ff.addWidget(self._ana_fitfunc)
-        fitl.addLayout(r_ff)
-
-        r_bg = QHBoxLayout()
-        r_bg.addWidget(QLabel("Background:"))
-        self._ana_fitbg = QComboBox()
-        self._ana_fitbg.addItems(["linear", "none", "constant", "raw"])
-        r_bg.addWidget(self._ana_fitbg)
-        fitl.addLayout(r_bg)
-
         self._ana_btn_fit = QPushButton("Fit peaks")
         self._ana_btn_fit.setEnabled(False)
         self._ana_btn_fit.clicked.connect(self._ana_fit)
@@ -167,14 +130,6 @@ class AnalysisTab(QWidget):
         # thresholds group
         g_thr = QGroupBox("3  Find thresholds")
         thrl = QVBoxLayout(g_thr)
-        self._ana_thr_area  = QCheckBox("Fit area")
-        self._ana_thr_int   = QCheckBox("Integral")
-        self._ana_thr_max   = QCheckBox("Maximum")
-        self._ana_thr_total = QCheckBox("Total area")
-        self._ana_thr_area.setChecked(True)
-        for cb in (self._ana_thr_area, self._ana_thr_int,
-                   self._ana_thr_max, self._ana_thr_total):
-            thrl.addWidget(cb)
         self._ana_btn_thr = QPushButton("Find thresholds…")
         self._ana_btn_thr.setEnabled(False)
         self._ana_btn_thr.clicked.connect(self._ana_thresholds)
@@ -183,6 +138,28 @@ class AnalysisTab(QWidget):
         self._ana_thr_lbl.setWordWrap(True)
         thrl.addWidget(self._ana_thr_lbl)
         sl.addWidget(g_thr)
+
+        # Inspect fits group
+        g_insp = QGroupBox("Inspect fits")
+        insp_l = QVBoxLayout(g_insp)
+
+        r_insp_peak = QHBoxLayout()
+        r_insp_peak.addWidget(QLabel("Peak:"))
+        self._ana_insp_peak_sel = QComboBox()
+        self._ana_insp_peak_sel.currentIndexChanged.connect(
+            self._ana_inspect_peak_changed
+        )
+        r_insp_peak.addWidget(self._ana_insp_peak_sel)
+        insp_l.addLayout(r_insp_peak)
+
+        self._ana_btn_insp = QPushButton("Inspect…")
+        self._ana_btn_insp.setEnabled(False)
+        self._ana_btn_insp.clicked.connect(self._ana_inspect_start)
+        insp_l.addWidget(self._ana_btn_insp)
+        self._ana_insp_lbl = QLabel("")
+        self._ana_insp_lbl.setWordWrap(True)
+        insp_l.addWidget(self._ana_insp_lbl)
+        sl.addWidget(g_insp)
 
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
@@ -223,19 +200,133 @@ class AnalysisTab(QWidget):
         self._ana_btn_act_skip  = QPushButton("Skip")
         self._ana_btn_act_comp  = QPushButton("Compute threshold")
         self._ana_btn_act_next  = QPushButton("Next  ▶")
+        self._ana_btn_act_insp_prev  = QPushButton("◀  Prev spectrum")
+        self._ana_btn_act_insp_next  = QPushButton("Next spectrum  ▶")
+        self._ana_btn_act_insp_close = QPushButton("✓  Close inspect")
         self._ana_btn_act_done.clicked.connect(self._ana_done_clicking_peaks)
         self._ana_btn_act_conf.clicked.connect(self._ana_confirm_window)
         self._ana_btn_act_skip.clicked.connect(self._ana_skip_window)
         self._ana_btn_act_comp.clicked.connect(self._ana_compute_threshold)
         self._ana_btn_act_next.clicked.connect(self._ana_next_threshold)
+        self._ana_btn_act_insp_prev.clicked.connect(self._ana_inspect_prev)
+        self._ana_btn_act_insp_next.clicked.connect(self._ana_inspect_next)
+        self._ana_btn_act_insp_close.clicked.connect(self._ana_inspect_close)
         for w in (self._ana_action_lbl, self._ana_btn_act_done,
                   self._ana_btn_act_conf, self._ana_btn_act_skip,
-                  self._ana_btn_act_comp, self._ana_btn_act_next):
+                  self._ana_btn_act_comp, self._ana_btn_act_next,
+                  self._ana_btn_act_insp_prev, self._ana_btn_act_insp_next,
+                  self._ana_btn_act_insp_close):
             ab.addWidget(w)
         self._ana_action_bar.setVisible(False)
         rl.addWidget(self._ana_action_bar)
 
         layout.addWidget(right, stretch=1)
+
+        self._ana_build_settings_dialog()
+
+    # ── Analysis: settings dialog ─────────────────────────────────
+
+    def _ana_build_settings_dialog(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Analysis Settings")
+        dl = QVBoxLayout(dlg)
+
+        # Select peaks settings
+        g_sc = QGroupBox("Select peaks")
+        scl = QVBoxLayout(g_sc)
+
+        r_win = QHBoxLayout()
+        r_win.addWidget(QLabel("Window width:"))
+        self._ana_window_width = QLineEdit("0.05")
+        r_win.addWidget(self._ana_window_width)
+        scl.addLayout(r_win)
+
+        r_xu = QHBoxLayout()
+        r_xu.addWidget(QLabel("X unit:"))
+        self._ana_rb_ev = QRadioButton("eV")
+        self._ana_rb_nm = QRadioButton("nm")
+        self._ana_rb_ev.setChecked(True)
+        r_xu.addWidget(self._ana_rb_ev)
+        r_xu.addWidget(self._ana_rb_nm)
+        scl.addLayout(r_xu)
+
+        r_sel = QHBoxLayout()
+        r_sel.addWidget(QLabel("Spectrum:"))
+        self._ana_spectrum_sel = QComboBox()
+        self._ana_spectrum_sel.addItems(["last", "maxpeak", "maxsum"])
+        r_sel.addWidget(self._ana_spectrum_sel)
+        scl.addLayout(r_sel)
+
+        r_ys = QHBoxLayout()
+        r_ys.addWidget(QLabel("Y scale:"))
+        self._ana_rb_log = QRadioButton("log")
+        self._ana_rb_lin = QRadioButton("linear")
+        self._ana_rb_log.setChecked(True)
+        r_ys.addWidget(self._ana_rb_log)
+        r_ys.addWidget(self._ana_rb_lin)
+        scl.addLayout(r_ys)
+
+        dl.addWidget(g_sc)
+
+        # fit_nw settings
+        g_fit = QGroupBox("Fit peaks")
+        fitl = QVBoxLayout(g_fit)
+
+        r_ff = QHBoxLayout()
+        r_ff.addWidget(QLabel("Function:"))
+        self._ana_fitfunc = QComboBox()
+        self._ana_fitfunc.addItems(
+            ["gauss1", "gauss2", "gauss3", "gauss4", "lorentz1", "lorentz2"]
+        )
+        r_ff.addWidget(self._ana_fitfunc)
+        fitl.addLayout(r_ff)
+
+        r_bg = QHBoxLayout()
+        r_bg.addWidget(QLabel("Background:"))
+        self._ana_fitbg = QComboBox()
+        self._ana_fitbg.addItems(["linear", "none", "constant", "raw"])
+        r_bg.addWidget(self._ana_fitbg)
+        fitl.addLayout(r_bg)
+
+        r_fw = QHBoxLayout()
+        r_fw.addWidget(QLabel("Fix window below spectrum index:"))
+        self._ana_fitfix_idx = QLineEdit("")
+        self._ana_fitfix_idx.setPlaceholderText("blank = full tracking")
+        self._ana_fitfix_idx.setToolTip(
+            "0-based spectrum index, ordered by ascending power "
+            "(0 = lowest power). Spectra with index below this value keep "
+            "a fit window frozen at whatever position it had reached at "
+            "this index, instead of re-centering on the tracked peak.\n"
+            "Leave blank to track the peak across the full power series "
+            "(original behavior)."
+        )
+        r_fw.addWidget(self._ana_fitfix_idx)
+        fitl.addLayout(r_fw)
+
+        dl.addWidget(g_fit)
+
+        # thresholds settings
+        g_thr = QGroupBox("Find thresholds — mode")
+        thrl = QVBoxLayout(g_thr)
+        self._ana_thr_area  = QCheckBox("Fit area")
+        self._ana_thr_int   = QCheckBox("Integral")
+        self._ana_thr_max   = QCheckBox("Maximum")
+        self._ana_thr_total = QCheckBox("Total area")
+        self._ana_thr_area.setChecked(True)
+        for cb in (self._ana_thr_area, self._ana_thr_int,
+                   self._ana_thr_max, self._ana_thr_total):
+            thrl.addWidget(cb)
+
+        dl.addWidget(g_thr)
+
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(dlg.accept)
+        dl.addWidget(btn_close)
+
+        self._ana_settings_dialog = dlg
+
+    def _ana_open_settings(self):
+        self._ana_settings_dialog.exec_()
 
     # ── Analysis: file loading ────────────────────────────────────
 
@@ -259,8 +350,32 @@ class AnalysisTab(QWidget):
                              else f["counts"])        [:]
                 spec_raw  = (f["Spectra_raw"]        if "Spectra_raw"        in f
                              else spec_diff)          [:]  # fallback: same
-                pwr_ana_ds = (f["Power_uncalibrated"] if "Power_uncalibrated" in f
-                              else f["powers_W"])
+                if "Power" in f:
+                    pwr_ana_ds = f["Power"]
+                else:
+                    uncal_ds = (f["Power_uncalibrated"] if "Power_uncalibrated" in f
+                                else f.get("powers_W"))
+                    if uncal_ds is None:
+                        QMessageBox.critical(
+                            self, "Load error",
+                            f"No power dataset found in:\n{path}"
+                        )
+                        return
+                    msg = QMessageBox(self)
+                    msg.setIcon(QMessageBox.Warning)
+                    msg.setWindowTitle("No calibrated power")
+                    msg.setText(
+                        "This file has no calibrated 'Power' dataset "
+                        "(transmission-corrected power at the sample).\n\n"
+                        "Use the uncalibrated power instead, or cancel loading?"
+                    )
+                    use_btn    = msg.addButton("Use uncalibrated power", QMessageBox.AcceptRole)
+                    cancel_btn = msg.addButton("Cancel", QMessageBox.RejectRole)
+                    msg.setDefaultButton(cancel_btn)
+                    msg.exec_()
+                    if msg.clickedButton() is not use_btn:
+                        return
+                    pwr_ana_ds = uncal_ds
                 powers_W   = pwr_ana_ds[:].astype(float)
                 _pwr_units = pwr_ana_ds.attrs.get("units", "W")
                 spot_diam_um = float(f.attrs["spot_diameter_um"]) \
@@ -289,6 +404,7 @@ class AnalysisTab(QWidget):
         self._ana_file = path
         self._ana_nw   = nw
         self._ana_mode = "idle"
+        self._ana_thr_results = {}
         self._ana_action_bar.setVisible(False)
         self._ana_sc_cleanup()
 
@@ -303,9 +419,12 @@ class AnalysisTab(QWidget):
         self._ana_btn_fit.setEnabled(False)
         self._ana_btn_thr.setEnabled(False)
         self._ana_btn_save.setEnabled(True)
+        self._ana_btn_insp.setEnabled(False)
+        self._ana_insp_peak_sel.clear()
         self._ana_sc_lbl.setText("")
         self._ana_fit_lbl.setText("")
         self._ana_thr_lbl.setText("")
+        self._ana_insp_lbl.setText("")
         self._ana_plot_spectrum()
         parent = self.parent()
         if parent is not None and hasattr(parent, "statusBar"):
@@ -325,19 +444,26 @@ class AnalysisTab(QWidget):
             return _HC_EV_NM / x_val
         return x_val
 
+    def _ana_display_spectra(self, nw):
+        """(n_wl, n_powers) spectra to plot for the human — dark-subtracted
+        if available, falling back to raw counts otherwise. Numerics (fit_nw,
+        _ana_integrate) pick their own spectra independently of this."""
+        return nw.spectra_diff if nw.spectra_diff is not None else nw.spectra_raw
+
     def _ana_plot_spectrum(self):
         nw = self._ana_nw
         if nw is None:
             return
         ax = self._ana_canvas.reset_axes()
         wl     = nw.wavelength
-        n_p    = nw.spectra_raw.shape[1]
+        spectra = self._ana_display_spectra(nw)
+        n_p    = spectra.shape[1]
         x   = self._ana_x_of_wl(wl)
         s   = np.argsort(x)
         vmin, vmax = nw.power[0], nw.power[-1]
         mlp = MultiLinePlotter(ax, SequentialScheme(vmin=vmin, vmax=vmax, cmap=PLASMA))
         for p in range(n_p):
-            item = mlp.plot(x[s], nw.spectra_raw[s, p], value=nw.power[p], width=0.7)
+            item = mlp.plot(x[s], spectra[s, p], value=nw.power[p], width=0.7)
             item.setOpacity(0.8)
         self._ana_canvas.add_colorbar_legend(
             GradientLegend(cmap=PLASMA, vmin=vmin, vmax=vmax, label="Power (mW)")
@@ -357,14 +483,16 @@ class AnalysisTab(QWidget):
             return
         self._ana_sc_cleanup()
 
+        spectra = self._ana_display_spectra(nw)
+
         # Choose reference spectrum
         sel = self._ana_spectrum_sel.currentText()
         if sel == "last":
-            ref = nw.spectra_raw.shape[1] - 1
+            ref = spectra.shape[1] - 1
         elif sel == "maxpeak":
-            ref = int(np.argmax(np.max(nw.spectra_raw, axis=0)))
+            ref = int(np.argmax(np.max(spectra, axis=0)))
         else:
-            ref = int(np.argmax(np.sum(nw.spectra_raw, axis=0)))
+            ref = int(np.argmax(np.sum(spectra, axis=0)))
         self._ana_sc_ref_idx = ref
 
         # Draw reference spectrum
@@ -373,7 +501,7 @@ class AnalysisTab(QWidget):
         wl   = nw.wavelength
         x    = self._ana_x_of_wl(wl)
         s    = np.argsort(x)
-        spec = nw.spectra_raw[:, ref]
+        spec = spectra[:, ref]
         ax.plot(x[s], spec[s], pen=pg.mkPen("steelblue", width=1.0))
         x_label = "Energy (eV)" if self._ana_rb_ev.isChecked() else "Wavelength (nm)"
         ax.setLabel("bottom", x_label)
@@ -396,6 +524,9 @@ class AnalysisTab(QWidget):
         self._ana_btn_act_skip.setVisible(False)
         self._ana_btn_act_comp.setVisible(False)
         self._ana_btn_act_next.setVisible(False)
+        self._ana_btn_act_insp_prev.setVisible(False)
+        self._ana_btn_act_insp_next.setVisible(False)
+        self._ana_btn_act_insp_close.setVisible(False)
         self._ana_action_bar.setVisible(True)
         parent = self.parent()
         if parent is not None and hasattr(parent, "statusBar"):
@@ -455,7 +586,7 @@ class AnalysisTab(QWidget):
         x    = self._ana_x_of_wl(wl)
         s    = np.argsort(x)
         ref  = self._ana_sc_ref_idx
-        spec = nw.spectra_raw[:, ref]
+        spec = self._ana_display_spectra(nw)[:, ref]
 
         x_peak = self._ana_sc_clicks_x[j]
         try:
@@ -504,6 +635,9 @@ class AnalysisTab(QWidget):
         self._ana_btn_act_skip.setVisible(True)
         self._ana_btn_act_comp.setVisible(False)
         self._ana_btn_act_next.setVisible(False)
+        self._ana_btn_act_insp_prev.setVisible(False)
+        self._ana_btn_act_insp_next.setVisible(False)
+        self._ana_btn_act_insp_close.setVisible(False)
         self._ana_action_bar.setVisible(True)
         parent = self.parent()
         if parent is not None and hasattr(parent, "statusBar"):
@@ -598,7 +732,8 @@ class AnalysisTab(QWidget):
         x   = self._ana_x_of_wl(wl)
         s   = np.argsort(x)
         ref = int(nw.start_conditions[2, 0])
-        ax.plot(x[s], nw.spectra_raw[s, ref], pen=pg.mkPen("steelblue", width=1.0))
+        ax.plot(x[s], self._ana_display_spectra(nw)[s, ref],
+                pen=pg.mkPen("steelblue", width=1.0))
         for k in range(nw.n_sel_peaks):
             pi = int(nw.start_conditions[0, k])
             line = pg.InfiniteLine(
@@ -625,6 +760,25 @@ class AnalysisTab(QWidget):
         fitfunction = self._ana_fitfunc.currentText()
         subtract_bg = self._ana_fitbg.currentText()
 
+        fix_text = self._ana_fitfix_idx.text().strip()
+        fixed_window_below = None
+        if fix_text:
+            try:
+                fixed_window_below = int(fix_text)
+            except ValueError:
+                QMessageBox.warning(
+                    self, "Invalid input",
+                    "'Fix window below spectrum index' must be an integer "
+                    "(or left blank for full tracking)."
+                )
+                return
+            if fixed_window_below < 0:
+                QMessageBox.warning(
+                    self, "Invalid input",
+                    "'Fix window below spectrum index' must be 0 or greater."
+                )
+                return
+
         parent = self.parent()
         if parent is not None and hasattr(parent, "statusBar"):
             parent.statusBar().showMessage("Fitting… please wait.")
@@ -633,7 +787,8 @@ class AnalysisTab(QWidget):
             nwa.fit_nw(nw,
                        subtract_fit_background=subtract_bg,
                        fitfunction=fitfunction,
-                       show_progress=False)
+                       show_progress=False,
+                       fixed_window_below_index=fixed_window_below)
         except Exception as exc:
             QMessageBox.critical(self, "fit_nw error", str(exc))
             return
@@ -648,6 +803,13 @@ class AnalysisTab(QWidget):
             f"{fitfunction} fit done\n{n_ok}/{n_total} converged"
         )
         self._ana_btn_thr.setEnabled(True)
+        self._ana_btn_insp.setEnabled(True)
+        self._ana_insp_peak_sel.blockSignals(True)
+        self._ana_insp_peak_sel.clear()
+        self._ana_insp_peak_sel.addItems(
+            [f"Peak {k+1}" for k in range(nw.n_sel_peaks)]
+        )
+        self._ana_insp_peak_sel.blockSignals(False)
         if parent is not None and hasattr(parent, "statusBar"):
             parent.statusBar().showMessage(
                 f"Analysis: fit complete ({n_ok}/{n_total} converged). Integrating…"
@@ -856,6 +1018,9 @@ class AnalysisTab(QWidget):
         self._ana_btn_act_next.setText(
             "Skip" if idx + 1 < len(self._ana_thr_queue) else "Finish"
         )
+        self._ana_btn_act_insp_prev.setVisible(False)
+        self._ana_btn_act_insp_next.setVisible(False)
+        self._ana_btn_act_insp_close.setVisible(False)
         self._ana_action_bar.setVisible(True)
         parent = self.parent()
         if parent is not None and hasattr(parent, "statusBar"):
@@ -1066,6 +1231,140 @@ class AnalysisTab(QWidget):
 
         self._ana_canvas.draw_idle()
 
+    # ── Analysis: inspect fits ────────────────────────────────────
+
+    def _ana_inspect_start(self):
+        nw = self._ana_nw
+        if nw is None or nw.fits is None:
+            return
+        self._ana_insp_peak = max(0, self._ana_insp_peak_sel.currentIndex())
+        # Start on the reference power step for this peak — it's the one
+        # the fit was seeded from, so it's the most likely to have converged.
+        ref_idx = 0
+        if nw.start_conditions is not None:
+            ref_idx = int(round(float(nw.start_conditions[2, self._ana_insp_peak])))
+        self._ana_insp_power_idx = max(0, min(ref_idx, len(nw.power) - 1))
+        self._ana_mode = "inspect"
+
+        self._ana_btn_act_done.setVisible(False)
+        self._ana_btn_act_conf.setVisible(False)
+        self._ana_btn_act_skip.setVisible(False)
+        self._ana_btn_act_comp.setVisible(False)
+        self._ana_btn_act_next.setVisible(False)
+        self._ana_btn_act_insp_prev.setVisible(True)
+        self._ana_btn_act_insp_next.setVisible(True)
+        self._ana_btn_act_insp_close.setVisible(True)
+        self._ana_action_bar.setVisible(True)
+
+        self._ana_inspect_draw()
+
+    def _ana_inspect_peak_changed(self, idx):
+        if self._ana_mode != "inspect" or idx < 0:
+            return
+        nw = self._ana_nw
+        if nw is None or nw.fits is None:
+            return
+        self._ana_insp_peak = idx
+        ref_idx = 0
+        if nw.start_conditions is not None:
+            ref_idx = int(round(float(nw.start_conditions[2, idx])))
+        self._ana_insp_power_idx = max(0, min(ref_idx, len(nw.power) - 1))
+        self._ana_inspect_draw()
+
+    def _ana_inspect_prev(self):
+        if self._ana_mode != "inspect":
+            return
+        self._ana_insp_power_idx = max(0, self._ana_insp_power_idx - 1)
+        self._ana_inspect_draw()
+
+    def _ana_inspect_next(self):
+        if self._ana_mode != "inspect":
+            return
+        n_powers = len(self._ana_nw.power)
+        self._ana_insp_power_idx = min(n_powers - 1, self._ana_insp_power_idx + 1)
+        self._ana_inspect_draw()
+
+    def _ana_inspect_close(self):
+        if self._ana_mode != "inspect":
+            return
+        self._ana_insp_span = None
+        self._ana_action_bar.setVisible(False)
+        self._ana_mode = "idle"
+        self._ana_plot_ll()
+
+    def _ana_inspect_draw(self):
+        """Show the single spectrum at the current power step, with the
+        fit interval shaded and the fitted lineshape (if converged)
+        overlaid on top of the dark-subtracted counts (falls back to raw
+        if no dark-subtracted spectra are available)."""
+        nw = self._ana_nw
+        j  = self._ana_insp_peak
+        i  = self._ana_insp_power_idx
+        n_powers = len(nw.power)
+
+        ax = self._ana_canvas.reset_axes()
+        ax.setLogMode(y=self._ana_rb_log.isChecked())
+
+        wl     = nw.wavelength
+        x_full = self._ana_x_of_wl(wl)
+        s_full = np.argsort(x_full)
+        ax.plot(x_full[s_full], self._ana_display_spectra(nw)[s_full, i],
+                pen=pg.mkPen("steelblue", width=1.0))
+
+        fit_ns = nw.fits[j][i] if nw.fits is not None else None
+        fdata  = nw.fit_data[j][i] if nw.fit_data is not None else None
+        converged = fit_ns is not None
+
+        if fdata is not None and len(fdata):
+            fdata = np.asarray(fdata, dtype=float)
+            X_bg, Y_bg, bg = fdata[:, 0], fdata[:, 1], fdata[:, 2]
+            x_win = self._ana_x_of_wl(X_bg)
+            order_win = np.argsort(x_win)
+            x_win_s   = x_win[order_win]
+            y_raw_win = (Y_bg + bg)[order_win]
+
+            # Highlight the windowed raw data on top of the full spectrum
+            ax.plot(x_win_s, y_raw_win, pen=pg.mkPen("orange", width=2.0),
+                    symbol="o", symbolSize=5, symbolBrush="orange")
+
+            # Shade the fit interval (static replay — not draggable here)
+            lo_disp, hi_disp = float(np.min(x_win_s)), float(np.max(x_win_s))
+            self._ana_insp_span = DraggableSpan(ax, color=(0, 150, 0, 60),
+                                                movable=False)
+            self._ana_insp_span.set_range(lo_disp, hi_disp)
+
+            if converged:
+                x_fit_nm = np.linspace(float(X_bg.min()), float(X_bg.max()), 200)
+                model_fn = (nwa._lorentz_n_model(fit_ns.n) if fit_ns.is_lorentz
+                            else nwa._gauss_n_model(fit_ns.n))
+                y_fit_bgsub = model_fn(x_fit_nm, *fit_ns.popt)
+                y_fit_raw   = y_fit_bgsub + np.interp(x_fit_nm, X_bg, bg)
+                x_fit_disp  = self._ana_x_of_wl(x_fit_nm)
+                order_fit   = np.argsort(x_fit_disp)
+                ax.plot(x_fit_disp[order_fit], y_fit_raw[order_fit],
+                        pen=pg.mkPen("red", width=1.5))
+        else:
+            self._ana_insp_span = None
+
+        x_label = "Energy (eV)" if self._ana_rb_ev.isChecked() else "Wavelength (nm)"
+        ax.setLabel("bottom", x_label)
+        ax.setLabel("left", "Counts")
+        status = "fit converged" if converged else "fit did NOT converge / no window data"
+        power_i = nw.power[i]
+        ax.setTitle(
+            f"{nw.name} — peak {j+1}/{nw.n_sel_peaks}, "
+            f"power step {i+1}/{n_powers}  (P = {power_i:.4g} mW)\n{status}"
+        )
+        ax.showGrid(x=True, y=True, alpha=0.3)
+        self._ana_canvas.draw_idle()
+
+        self._ana_insp_lbl.setText(
+            f"Peak {j+1}, step {i+1}/{n_powers} — {status}"
+        )
+        self._ana_action_lbl.setText(
+            f"Inspecting peak {j+1}, power step {i+1}/{n_powers}"
+        )
+
     # ── Save results ─────────────────────────────────────────────
 
     def _ana_save(self):
@@ -1138,24 +1437,30 @@ class AnalysisTab(QWidget):
                     except Exception:
                         pass
 
-                # ── PeakPos / PeakPosErr ──────────────────────────
+                # ── PeakPos / PeakPosErr (eV) ─────────────────────
+                # Fitted centers come out of fit_nw in nm (fits are run
+                # against nw.wavelength); convert to energy before saving.
                 pp = getattr(nw, "peak_pos", None)
+                pos_nm = None
                 if pp is not None:
                     try:
                         n_pk = len(pp); n_pw = len(pp[0]) if n_pk > 0 else 0
-                        ds = grp.create_dataset("PeakPos",
-                                                data=_cell_to_mat_first(pp, n_pk, n_pw))
-                        ds.attrs["units"] = "nm"
+                        pos_nm = _cell_to_mat_first(pp, n_pk, n_pw)
+                        ds = grp.create_dataset("PeakPos", data=_HC_EV_NM / pos_nm)
+                        ds.attrs["units"] = "eV"
                     except Exception:
                         pass
 
                 ppe = getattr(nw, "peak_pos_err", None)
-                if ppe is not None:
+                if ppe is not None and pos_nm is not None:
                     try:
                         n_pk = len(ppe); n_pw = len(ppe[0]) if n_pk > 0 else 0
-                        ds = grp.create_dataset("PeakPosErr",
-                                                data=_cell_to_mat_first(ppe, n_pk, n_pw))
-                        ds.attrs["units"] = "nm"
+                        err_nm = _cell_to_mat_first(ppe, n_pk, n_pw)
+                        # dE = (hc / lambda^2) * dlambda
+                        ds = grp.create_dataset(
+                            "PeakPosErr", data=_HC_EV_NM / pos_nm**2 * err_nm
+                        )
+                        ds.attrs["units"] = "eV"
                     except Exception:
                         pass
 
@@ -1178,36 +1483,64 @@ class AnalysisTab(QWidget):
                     except Exception:
                         pass
 
-                # ── FitParameters ─────────────────────────────────
+                # ── FitParameters: (n_peaks, n_powers, n_params) ──
                 fits = getattr(nw, "fits", None)
                 if fits is not None:
-                    fp_grp = grp.create_group("FitParameters")
                     try:
-                        for j, peak_fits in enumerate(fits):
-                            pk_grp = fp_grp.create_group(f"peak_{j}")
-                            for i, fit_ns in enumerate(peak_fits):
+                        n_pk = len(fits); n_pw = len(fits[0]) if n_pk > 0 else 0
+                        n_par = 0
+                        for peak_fits in fits:
+                            for fit_ns in peak_fits:
                                 if fit_ns is not None:
                                     popt = getattr(fit_ns, "popt", fit_ns)
                                     if popt is not None:
-                                        pk_grp.create_dataset(
-                                            f"power_{i}",
-                                            data=np.atleast_1d(popt).astype(float)
-                                        )
+                                        n_par = max(n_par, len(np.atleast_1d(popt)))
+                        if n_par > 0:
+                            fp_arr = np.full((n_pk, n_pw, n_par), np.nan)
+                            for j, peak_fits in enumerate(fits):
+                                for i, fit_ns in enumerate(peak_fits):
+                                    if fit_ns is not None:
+                                        popt = getattr(fit_ns, "popt", fit_ns)
+                                        if popt is not None:
+                                            popt = np.atleast_1d(popt).astype(float)
+                                            fp_arr[j, i, :len(popt)] = popt
+                            ds = grp.create_dataset("FitParameters", data=fp_arr)
+                            ds.attrs["description"] = (
+                                "peaks x powers x parameters, from the fit model's popt "
+                                "(e.g. gauss: amplitude, center, sigma)"
+                            )
                     except Exception:
                         pass
 
-                # ── BackgroundData ────────────────────────────────
+                # ── BackgroundData: (n_peaks, n_powers, n_datapoints) ──
+                # Named "BackgroundData", not "FitBackground", to avoid
+                # colliding with the group-level "FitBackground" attribute
+                # (the background-subtraction mode string, e.g. "linear").
                 fit_data = getattr(nw, "fit_data", None)
                 if fit_data is not None:
-                    bg_grp = grp.create_group("BackgroundData")
                     try:
-                        for j, peak_data in enumerate(fit_data):
-                            pk_grp = bg_grp.create_group(f"peak_{j}")
-                            for i, data_arr in enumerate(peak_data):
+                        n_pk = len(fit_data); n_pw = len(fit_data[0]) if n_pk > 0 else 0
+                        n_pts = 0
+                        for peak_data in fit_data:
+                            for data_arr in peak_data:
                                 if data_arr is not None:
                                     arr = np.atleast_2d(data_arr)
                                     if arr.shape[1] >= 3:
-                                        pk_grp.create_dataset(f"power_{i}", data=arr[:, 2])
+                                        n_pts = max(n_pts, arr.shape[0])
+                        if n_pts > 0:
+                            bg_arr = np.full((n_pk, n_pw, n_pts), np.nan)
+                            for j, peak_data in enumerate(fit_data):
+                                for i, data_arr in enumerate(peak_data):
+                                    if data_arr is not None:
+                                        arr = np.atleast_2d(data_arr)
+                                        if arr.shape[1] >= 3:
+                                            bg_col = arr[:, 2]
+                                            bg_arr[j, i, :len(bg_col)] = bg_col
+                            ds = grp.create_dataset("BackgroundData", data=bg_arr)
+                            ds.attrs["description"] = (
+                                "peaks x powers x datapoints: local background curve "
+                                "subtracted before fitting"
+                            )
                     except Exception:
                         pass
 
@@ -1216,58 +1549,120 @@ class AnalysisTab(QWidget):
                 if pi is not None:
                     grp.create_dataset("PeakIntegral", data=np.array(pi, dtype=float))
 
-                # ── Specsum ───────────────────────────────────────
+                # ── Specsum: (n_entries, n_powers), values only ───
                 specsum = getattr(nw, "specsum", None)
                 if specsum:
-                    ss_grp = grp.create_group("Specsum")
+                    n_entries = len(specsum)
+                    n_pw = max((len(entry.get("values", [])) for entry in specsum),
+                               default=0)
+                    ss_arr = np.full((n_entries, n_pw), np.nan)
                     for k, entry in enumerate(specsum):
-                        e_grp = ss_grp.create_group(str(k))
-                        vals  = np.array(entry.get("values", []), dtype=float)
-                        e_grp.create_dataset("values", data=vals)
-                        e_grp.attrs["center"]      = float(entry.get("center", np.nan))
-                        e_grp.attrs["width"]       = float(entry.get("width", np.nan))
-                        e_grp.attrs["spectrumtype"] = str(entry.get("spectype", ""))
+                        vals = np.array(entry.get("values", []), dtype=float)
+                        ss_arr[k, :len(vals)] = vals
+                    grp.create_dataset("Specsum", data=ss_arr)
 
-                # ── Thresholds ────────────────────────────────────
-                thr_results = getattr(nw, "thr_results", None)
+                # ── Thresholds ─────────────────────────────────────
+                # Merge persisted results (set once the multi-item wizard is
+                # finished) with whatever is currently computed in-session,
+                # so a threshold computed but not yet stepped through to
+                # "Finish" is still included. Saved flat into the analysis
+                # group — the threshold-determination mode (fit-area,
+                # integral, ...) isn't recorded, only the resulting per-peak
+                # numbers.
+                thr_results = dict(getattr(nw, "thr_results", None) or {})
+                thr_results.update(self._ana_thr_results or {})
                 if thr_results:
-                    thr_grp  = grp.create_group("Thresholds")
                     spot_r   = getattr(nw, "spot_radius_short", None)
                     rep_rate = getattr(nw, "rep_rate", None)
-                    for title, data in thr_results.items():
-                        tg      = thr_grp.create_group(title)
-                        thr_mW  = data.get("threshold", np.nan)
-                        slope   = data.get("slope",     np.nan)
-                        intcpt  = data.get("intercept", np.nan)
-                        p_sel   = np.array(data.get("sel_power",  []), dtype=float)
-                        v_sel   = np.array(data.get("sel_values", []), dtype=float)
+                    n_pk     = getattr(nw, "n_sel_peaks", None) or 0
 
-                        thr_err_mW  = data.get("threshold_err", np.nan)
-                        slope_err   = data.get("slope_err",     np.nan)
-
+                    def _thr_to_fluence(thr_mW, thr_err_mW):
                         if (spot_r is not None and rep_rate is not None
                                 and not np.isnan(thr_mW)
                                 and float(rep_rate) > 0 and float(spot_r) > 0):
-                            import math
                             d_cm = 2.0 * float(spot_r) * 1e-4
                             P_W  = float(thr_mW) * 1e-3
                             f_Hz = float(rep_rate)
                             conv = 4.0 / f_Hz / math.pi / d_cm**2 * 1e6  # mW→µJ/cm²
-                            thr_fluence = conv * P_W
-                            tg.attrs["Threshold"]      = thr_fluence
-                            tg.attrs["ThresholdUnits"] = "uJ/cm^2"
-                            if not np.isnan(thr_err_mW):
-                                tg.attrs["ThresholdErr"] = conv * float(thr_err_mW) * 1e-3
-                            else:
-                                tg.attrs["ThresholdErr"] = np.nan
-                        else:
-                            tg.attrs["Threshold"]      = thr_mW
-                            tg.attrs["ThresholdUnits"] = "mW"
-                            tg.attrs["ThresholdErr"]   = thr_err_mW
+                            err = (conv * float(thr_err_mW) * 1e-3
+                                   if not np.isnan(thr_err_mW) else np.nan)
+                            return conv * P_W, err, "uJ/cm^2"
+                        return thr_mW, thr_err_mW, "mW"
 
-                        tg.attrs["slope"]     = slope
-                        tg.attrs["slope_err"] = slope_err if not np.isnan(slope_err) else np.nan
-                        tg.attrs["intercept"] = intcpt
+                    # Split "peak N <mode>" titles (e.g. "peak 1 fit-area") from
+                    # peak-less ones (e.g. "total peak area"). If more than one
+                    # mode was computed for the same peak, the last one in
+                    # thr_results wins (mode identity is discarded either way).
+                    by_peak = {}   # peak_idx -> data
+                    other   = {}   # title -> data
+                    for title, data in thr_results.items():
+                        m = re.match(r"^peak (\d+) (.+)$", title)
+                        if m:
+                            by_peak[int(m.group(1)) - 1] = data
+                        else:
+                            other[title] = data
+
+                    if by_peak:
+                        n_pk_out = max(n_pk, max(by_peak) + 1)
+                        thr_arr       = np.full(n_pk_out, np.nan)
+                        thr_err_arr   = np.full(n_pk_out, np.nan)
+                        slope_arr     = np.full(n_pk_out, np.nan)
+                        slope_err_arr = np.full(n_pk_out, np.nan)
+                        intcpt_arr    = np.full(n_pk_out, np.nan)
+                        p_sel_list    = [None] * n_pk_out
+                        v_sel_list    = [None] * n_pk_out
+                        units = "mW"
+                        for peak_idx, data in by_peak.items():
+                            thr_val, err_val, units = _thr_to_fluence(
+                                data.get("threshold", np.nan),
+                                data.get("threshold_err", np.nan)
+                            )
+                            thr_arr[peak_idx]       = thr_val
+                            thr_err_arr[peak_idx]   = err_val
+                            slope_arr[peak_idx]     = data.get("slope", np.nan)
+                            slope_err_arr[peak_idx] = data.get("slope_err", np.nan)
+                            intcpt_arr[peak_idx]    = data.get("intercept", np.nan)
+                            p_sel_list[peak_idx] = np.array(data.get("sel_power",  []), dtype=float)
+                            v_sel_list[peak_idx] = np.array(data.get("sel_values", []), dtype=float)
+
+                        grp.create_dataset("Threshold",    data=thr_arr)
+                        grp.create_dataset("ThresholdErr", data=thr_err_arr)
+                        grp.attrs["ThresholdUnits"] = units
+                        grp.create_dataset("Slope",        data=slope_arr)
+                        grp.create_dataset("SlopeErr",     data=slope_err_arr)
+                        grp.create_dataset("Intercept",    data=intcpt_arr)
+
+                        # FitIntervalPower/Values: (n_peaks, n_points), padded
+                        # with NaN for peaks with fewer selected points.
+                        n_pts = max((len(a) for a in p_sel_list if a is not None),
+                                    default=0)
+                        if n_pts > 0:
+                            fip = np.full((n_pk_out, n_pts), np.nan)
+                            fiv = np.full((n_pk_out, n_pts), np.nan)
+                            for peak_idx in range(n_pk_out):
+                                p_sel = p_sel_list[peak_idx]
+                                v_sel = v_sel_list[peak_idx]
+                                if p_sel is not None and p_sel.size:
+                                    fip[peak_idx, :len(p_sel)] = p_sel
+                                if v_sel is not None and v_sel.size:
+                                    fiv[peak_idx, :len(v_sel)] = v_sel
+                            grp.create_dataset("FitIntervalPower",  data=fip)
+                            grp.create_dataset("FitIntervalValues", data=fiv)
+
+                    for title, data in other.items():
+                        tg = grp.create_group(title)
+                        thr_val, err_val, units = _thr_to_fluence(
+                            data.get("threshold", np.nan),
+                            data.get("threshold_err", np.nan)
+                        )
+                        tg.attrs["Threshold"]      = thr_val
+                        tg.attrs["ThresholdErr"]   = err_val
+                        tg.attrs["ThresholdUnits"] = units
+                        tg.attrs["slope"]     = data.get("slope", np.nan)
+                        tg.attrs["slope_err"] = data.get("slope_err", np.nan)
+                        tg.attrs["intercept"] = data.get("intercept", np.nan)
+                        p_sel = np.array(data.get("sel_power",  []), dtype=float)
+                        v_sel = np.array(data.get("sel_values", []), dtype=float)
                         if p_sel.size:
                             tg.create_dataset("FitIntervalPower",  data=p_sel)
                         if v_sel.size:

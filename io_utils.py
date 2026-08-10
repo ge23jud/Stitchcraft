@@ -327,22 +327,16 @@ def _write_h5_file(output_path, wl_out, counts_diff, counts_raw, header_meta,
             cal_bs  = power_cal.get("atBS")
             cal_s   = power_cal.get("atSample")
             if cal_bs is not None and cal_s is not None:
-                hwp_bs,  pow_bs  = cal_bs
-                hwp_s,   pow_s   = cal_s
-                hwp_bs_r = np.round(hwp_bs).astype(int)
-                hwp_s_r  = np.round(hwp_s).astype(int)
-                common   = np.intersect1d(hwp_bs_r, hwp_s_r)
-                if len(common) >= 2:
-                    idx_bs = np.array([np.where(hwp_bs_r == h)[0][0] for h in common])
-                    idx_s  = np.array([np.where(hwp_s_r  == h)[0][0] for h in common])
-                    x = pow_bs[idx_bs]
-                    y = pow_s [idx_s ]
-                    a_transmission  = float(np.dot(x, y) / np.dot(x, x))
+                try:
+                    a_transmission, n_common = _compute_power_transmission(cal_bs, cal_s)
+                except ValueError:
+                    a_transmission = None
+                if a_transmission is not None:
                     power_for_derived = a_transmission * powers_W
                     d_pc = f.create_dataset("Power", data=power_for_derived * 1e3)
                     d_pc.attrs["units"]         = "mW"
                     d_pc.attrs["transmission"]  = a_transmission
-                    d_pc.attrs["n_cal_points"]  = len(common)
+                    d_pc.attrs["n_cal_points"]  = n_common
                     grp_c.attrs["transmission"] = a_transmission
 
         # ── Derived spatial/temporal quantities ───────────────────
@@ -358,6 +352,188 @@ def _write_h5_file(output_path, wl_out, counts_diff, counts_raw, header_meta,
                            / np.pi / dspot_cm ** 2 * 1e3)      # → mJ/cm²
                 d_fl = f.create_dataset("Pump_fluence", data=fluence)
                 d_fl.attrs["units"] = "mJ/cm^2"
+
+
+def _compute_power_transmission(cal_atbs, cal_atsample):
+    """Fit P_sample = a * P_BS (linear through origin, OLS) using the HWP
+    positions common to both calibration curves.
+
+    cal_atbs / cal_atsample are (hwp_positions, powers_W) tuples, as returned
+    by _parse_power_calibration(). Returns (a_transmission, n_common_points).
+    Raises ValueError if fewer than 2 common (rounded) HWP positions exist.
+    """
+    hwp_bs, pow_bs = cal_atbs
+    hwp_s,  pow_s  = cal_atsample
+    hwp_bs_r = np.round(hwp_bs).astype(int)
+    hwp_s_r  = np.round(hwp_s).astype(int)
+    common   = np.intersect1d(hwp_bs_r, hwp_s_r)
+    if len(common) < 2:
+        raise ValueError(
+            "Fewer than 2 common HWP positions between the atBS and "
+            "atSample calibration files."
+        )
+    idx_bs = np.array([np.where(hwp_bs_r == h)[0][0] for h in common])
+    idx_s  = np.array([np.where(hwp_s_r  == h)[0][0] for h in common])
+    x = pow_bs[idx_bs]
+    y = pow_s [idx_s ]
+    a_transmission = float(np.dot(x, y) / np.dot(x, x))
+    return a_transmission, len(common)
+
+
+def _parse_trpl_dat(filepath):
+    """Parse a PicoHarp-style TRPL histogram .dat file.
+
+    Expected layout (as exported by the PicoHarp TRPL acquisition software):
+        #PicoHarp 300  Histogram Data   ...   <MM/DD/YYYY  HH:MM:SS AM/PM>
+        #channels per curve
+        <n>
+        #display curve no.
+        ...
+        #ns/channel
+        <ns_per_channel>
+        #counts
+        <count_0>
+        <count_1>
+        ...
+
+    Returns dict: date_str (raw date/time string from line 1),
+    ns_per_channel (float), counts (float64 array, one value per channel).
+    """
+    with open(filepath, encoding="latin-1", errors="replace") as fh:
+        lines = fh.readlines()
+    if not lines:
+        raise ValueError(f"Empty file: {filepath}")
+
+    m = re.search(
+        r"\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}:\d{2}\s*[AP]M", lines[0]
+    )
+    date_str = re.sub(r"\s+", " ", m.group(0)).strip() if m else ""
+
+    ns_per_channel = None
+    counts = []
+    section = None
+    for line in lines[1:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            section = stripped.lstrip("#").strip().lower()
+            continue
+        if section == "ns/channel" and ns_per_channel is None:
+            try:
+                ns_per_channel = float(stripped)
+            except ValueError:
+                pass
+        elif section == "counts":
+            try:
+                counts.append(float(stripped))
+            except ValueError:
+                continue
+
+    if ns_per_channel is None:
+        raise ValueError(f"Could not find '#ns/channel' value in {filepath}")
+    if not counts:
+        raise ValueError(f"Could not find '#counts' data in {filepath}")
+
+    return {
+        "date_str":       date_str,
+        "ns_per_channel":  ns_per_channel,
+        "counts":         np.array(counts, dtype=float),
+    }
+
+
+def _write_trpl_h5_file(output_path, counts, ns_per_channel, date_str,
+                        power_uncal_mW, rep_rate_mhz, spot_diameter_um,
+                        power_cal=None):
+    """Write a single TRPL histogram (from a PicoHarp .dat file) to HDF5.
+
+    Structure
+    ---------
+    /Counts               float64 (n,)  — raw histogram, one value per channel
+    /Times                float64 (n,)  — 0, ns_per_channel, 2*ns_per_channel, …
+    /Power_uncalibrated   float64 (1,)  — user-entered power, mW
+    /Power                float64 (1,)  — calibrated power, mW (only if
+                                          power_cal has both atBS and atSample)
+    /Pump_fluence         float64 (1,)  — mJ/cm^2, from the calibrated power
+                                          when available, else the uncalibrated one
+    Root attrs: TimesUnit ("ns"), Date (raw date/time from the .dat header),
+                rep_rate_mhz, spot_diameter_um.
+    """
+    n     = len(counts)
+    times = np.arange(n, dtype=float) * float(ns_per_channel)
+
+    power_uncal_mW = float(power_uncal_mW)
+    power_uncal_W  = power_uncal_mW * 1e-3
+    power_for_derived_W = power_uncal_W
+
+    with h5py.File(output_path, "w") as f:
+        d_c = f.create_dataset("Counts", data=counts, compression="gzip")
+        d_c.attrs["units"] = "Counts"
+
+        d_t = f.create_dataset("Times", data=times, compression="gzip")
+        d_t.attrs["units"] = "ns"
+
+        f.attrs["TimesUnit"]        = "ns"
+        f.attrs["Date"]             = date_str
+        f.attrs["rep_rate_mhz"]     = float(rep_rate_mhz)
+        f.attrs["spot_diameter_um"] = float(spot_diameter_um)
+
+        d_pu = f.create_dataset(
+            "Power_uncalibrated", data=np.array([power_uncal_mW], dtype=float)
+        )
+        d_pu.attrs["units"] = "mW"
+
+        if power_cal is not None:
+            cal_bs = power_cal.get("atBS")
+            cal_s  = power_cal.get("atSample")
+            if cal_bs is not None and cal_s is not None:
+                a_transmission, n_common = _compute_power_transmission(cal_bs, cal_s)
+                power_for_derived_W = a_transmission * power_uncal_W
+                d_pc = f.create_dataset(
+                    "Power", data=np.array([power_for_derived_W * 1e3], dtype=float)
+                )
+                d_pc.attrs["units"]        = "mW"
+                d_pc.attrs["transmission"] = a_transmission
+                d_pc.attrs["n_cal_points"] = n_common
+
+        dspot_cm = float(spot_diameter_um) * 1e-4          # µm → cm
+        f_hz     = float(rep_rate_mhz) * 1e6               # MHz → Hz
+        fluence  = (4.0 * power_for_derived_W / f_hz
+                    / np.pi / dspot_cm ** 2 * 1e3)          # → mJ/cm²
+        d_fl = f.create_dataset("Pump_fluence", data=np.array([fluence], dtype=float))
+        d_fl.attrs["units"] = "mJ/cm^2"
+
+
+def _read_trpl_h5_file(path):
+    """Read a TRPL histogram HDF5 file written by _write_trpl_h5_file().
+
+    Returns dict: path, times (ns, n), counts (n), date (str | None),
+    power_mW (float | None, calibrated Power if present else
+    Power_uncalibrated), rep_rate_mhz (float | None),
+    spot_diameter_um (float | None).
+    """
+    with h5py.File(path, "r") as f:
+        if "Times" not in f or "Counts" not in f:
+            raise ValueError("No Times/Counts dataset found — not a TRPL HDF5 file.")
+        times  = f["Times"][:].astype(float)
+        counts = f["Counts"][:].astype(float)
+
+        pwr_ds = f["Power"] if "Power" in f else f.get("Power_uncalibrated")
+        power_mW = float(pwr_ds[0]) if pwr_ds is not None and len(pwr_ds) else None
+
+        date = f.attrs.get("Date")
+        rep_rate_mhz = float(f.attrs["rep_rate_mhz"]) if "rep_rate_mhz" in f.attrs else None
+        spot_diameter_um = float(f.attrs["spot_diameter_um"]) if "spot_diameter_um" in f.attrs else None
+
+    return {
+        "path":              path,
+        "times":             times,
+        "counts":            counts,
+        "date":              date,
+        "power_mW":          power_mW,
+        "rep_rate_mhz":      rep_rate_mhz,
+        "spot_diameter_um":  spot_diameter_um,
+    }
 
 
 def _parse_power_calibration(filepath):
