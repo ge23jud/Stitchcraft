@@ -71,11 +71,13 @@ def _new_nanowire():
         n_sel_peaks=0,
         fit_model=None,
         background_type=None,
+        fit_overrides=None,     # list of dicts or None — see fit_nw
         # Fit results  (lists of lists, [peak_idx][power_idx])
         fits=None,
         fit_data=None,          # each entry: ndarray (N, 3) = [X, Y, bg]
+        bg_ref_x=None,          # each entry: (x1, x2) or None — see fit_nw
         peak_maximum=None,      # (n_peaks, n_powers)
-        peak_integral=None,     # (n_peaks, n_powers) — after local bg subtraction
+        peak_integral=None,     # (n_peaks, n_powers) — raw counts (no bg subtraction) over the tracked fit window
         peak_pos=None,          # list[list[ndarray]]
         peak_pos_err=None,
         peak_area=None,
@@ -286,7 +288,13 @@ def subtract_local_background(X, Y, mode):
     """
     Subtract linear or constant baseline from Y over interval X.
     mode: 'linear', 'constant', or anything else (→ no subtraction).
-    Returns (X, Y_corrected, local_background).
+    Returns (X, Y_corrected, local_background, ref_x), where ref_x is the
+    (x1, x2) pair of reference-point x-positions the two ends of the
+    'linear' background line were averaged from (each the centroid of
+    the 4 points used) — for display/QA purposes (see analysis.py's
+    Inspect view) — or None for any other mode/fallback, where there is
+    no such two-point concept (a single constant level, no background at
+    all, or too few points to average).
     """
     X = np.asarray(X, dtype=float)
     Y = np.asarray(Y, dtype=float)
@@ -297,17 +305,105 @@ def subtract_local_background(X, Y, mode):
             x2 = np.mean(X[-n_pts:]); y2 = np.mean(Y[-n_pts:])
             slope = (y2 - y1) / (x2 - x1) if x2 != x1 else 0.0
             bg = y1 + slope * (X - x1)
+            ref_x = (float(x1), float(x2))
         else:
             bg = np.full_like(Y, np.min(Y))
-        return X, Y - bg, bg
+            ref_x = None
+        return X, Y - bg, bg, ref_x
     elif mode == 'constant':
         n_smooth = 20
         from scipy.ndimage import uniform_filter1d
         smoothed = uniform_filter1d(Y, size=min(n_smooth, len(Y)), mode='reflect')
         bg = np.full_like(Y, np.min(smoothed))
-        return X, Y - bg, bg
+        return X, Y - bg, bg, None
     else:
-        return X, Y, np.zeros_like(Y)
+        return X, Y, np.zeros_like(Y), None
+
+
+def _peakwidth_linear_background(X, Y, popt, n, is_lorentz,
+                                  sigma_mult_lo=3.0, sigma_mult_hi=3.0):
+    """
+    Linear background through two reference points placed just outside
+    the fitted peak(s) -- at (leftmost sub-peak's center - sigma_mult_lo*
+    sigma) and (rightmost sub-peak's center + sigma_mult_hi*sigma) --
+    instead of 'linear' mode's fixed window edges. For n>1 sub-peaks
+    (gauss2+/lorentz2+), only the leftmost and rightmost component's own
+    center/width set the two targets, matching how 'linear' already
+    treats the whole window as a single region. sigma_mult_lo/_hi are
+    independent so the two sides can be widened/narrowed separately —
+    e.g. if the peak is asymmetric or only one side tends to clip.
+
+    Motivation: 'linear' mode's edge points are only a good proxy for
+    "just outside the peak" when the fixed-width fit window happens to
+    be wide relative to however broad the peak is *at that specific
+    power step*. If the peak broadens substantially at higher power
+    while the window width stays fixed, the edges can end up sampling
+    the peak's own wings (biasing the background high) rather than flat
+    baseline; if the peak narrows, most of a wide window is background
+    that this alternative doesn't need but 'linear' also handles fine --
+    the failure mode this exists for is specifically the broad-peak case.
+
+    "sigma" is expressed via each component's own fitted FWHM for a
+    model-agnostic definition (a Gaussian's FWHM = 2*sigma*sqrt(2*ln2),
+    so sigma_mult*sigma = sigma_mult*FWHM/(2*sqrt(2*ln2))). Lorentzian
+    components have no native "sigma"; the same FWHM-based factor is
+    used against their own FWHM parameter as a comparably-generous
+    margin, not a statistically exact one.
+
+    Reference points are each the average of the 4 data points at or
+    just beyond their target x (mirroring 'linear' mode's edge-average
+    of 4 points), clipped to stay within the window if the target would
+    otherwise fall outside it. Returns (bg, ref_x) — bg aligned with the
+    input X's original order (X itself may be ascending or descending);
+    ref_x is the (x1, x2) pair of reference-point x-positions actually
+    used (each the centroid of its 4-point cluster), for display/QA.
+    """
+    X = np.asarray(X, dtype=float)
+    Y = np.asarray(Y, dtype=float)
+    x_lo, x_hi = float(np.min(X)), float(np.max(X))
+
+    def _fwhm_of(k):
+        if is_lorentz:
+            _A, fwhm, _center = popt[3*k], popt[3*k+1], popt[3*k+2]
+        else:
+            _a, _center, c = popt[3*k], popt[3*k+1], popt[3*k+2]
+            fwhm = abs(c) * 2 * np.sqrt(np.log(2))
+        return abs(float(fwhm))
+
+    centers = [float(popt[3*k + (2 if is_lorentz else 1)]) for k in range(n)]
+    left_k = int(np.argmin(centers))
+    right_k = int(np.argmax(centers))
+    sigma_to_fwhm = 2 * np.sqrt(2 * np.log(2))
+    margin_lo = sigma_mult_lo * _fwhm_of(left_k) / sigma_to_fwhm
+    margin_hi = sigma_mult_hi * _fwhm_of(right_k) / sigma_to_fwhm
+    target_lo = float(np.clip(centers[left_k] - margin_lo, x_lo, x_hi))
+    target_hi = float(np.clip(centers[right_k] + margin_hi, x_lo, x_hi))
+    if target_hi < target_lo:
+        target_lo, target_hi = target_hi, target_lo
+
+    order = np.argsort(X)
+    Xs, Ys = X[order], Y[order]
+    n_pts = 4
+
+    left_mask = Xs <= target_lo
+    if np.any(left_mask):
+        left_idx = np.where(left_mask)[0][-n_pts:]
+    else:
+        left_idx = np.arange(min(n_pts, len(Xs)))
+    x1, y1 = float(np.mean(Xs[left_idx])), float(np.mean(Ys[left_idx]))
+
+    right_mask = Xs >= target_hi
+    if np.any(right_mask):
+        right_idx = np.where(right_mask)[0][:n_pts]
+    else:
+        right_idx = np.arange(max(0, len(Xs) - n_pts), len(Xs))
+    x2, y2 = float(np.mean(Xs[right_idx])), float(np.mean(Ys[right_idx]))
+
+    slope = (y2 - y1) / (x2 - x1) if x2 != x1 else 0.0
+    bg_sorted = y1 + slope * (Xs - x1)
+    bg = np.empty_like(bg_sorted)
+    bg[order] = bg_sorted
+    return bg, (x1, x2)
 
 
 def _movmean(x, width):
@@ -525,18 +621,72 @@ def _lorentz_params_from_popt(popt, pcov, n):
             np.array(fwhm_list), np.array(fwhm_err_list))
 
 
-def _fit_gauss(X, Y, n=1):
+def _match_to_previous(prev_centers, cand_pos):
+    """
+    Greedy nearest-neighbor match: for each of the n previous component
+    centers, pick the closest available candidate position from this
+    step's found peaks. Once every candidate has been used once, matching
+    is allowed to reuse the closest one again — this is what happens when
+    peaks have merged into fewer local maxima than tracked components, and
+    it deliberately gives each previous component its own (non-identical)
+    seed instead of collapsing them onto one shared point.
+    Returns a list of n candidate indices, or all-None if there are no
+    candidates at all.
+    """
+    n = len(prev_centers)
+    m = len(cand_pos)
+    if m == 0:
+        return [None] * n
+    used = set()
+    assigned = []
+    for k in range(n):
+        avail = [idx for idx in range(m) if idx not in used] or list(range(m))
+        best_idx = min(avail, key=lambda idx: abs(cand_pos[idx] - prev_centers[k]))
+        assigned.append(best_idx)
+        used.add(best_idx)
+    return assigned
+
+
+def _fit_gauss(X, Y, n=1, prev_popt=None):
     """
     Fit n Gaussians to (X, Y).  Returns (popt, pcov, peakindex, findpeaks_fwhm)
     where peakindex is the array index of the strongest fitted peak.
     Returns (None, None, mid, nan) on failure.
+
+    prev_popt : 3*n params from the neighboring power step's fit for this
+        same peak, or None. When given, each sub-Gaussian's center/width
+        (not amplitude) is seeded from its nearest-matching previous
+        component instead of purely from this step's own peak-finding —
+        this keeps sub-peak identity stable across power steps and avoids
+        seeding two sub-Gaussians from the same identical point when only
+        one local maximum is found (e.g. merged/overlapping peaks).
+        Amplitude is always seeded from this step's own data (find_peaks'
+        prominence), since intensity can change by orders of magnitude
+        between power steps and the previous amplitude is not a reliable
+        scale guess. A previous component whose fitted area was negligible
+        (< 2% of that fit's total area) is treated as unreliable and NOT
+        used to seed center/width — otherwise a degenerate near-zero-width
+        "ghost" component (see width floor below) would seed itself right
+        back every step and never get a chance to re-anchor on real data.
+        Ignored entirely (falls back to pure peak-finding) if prev_popt's
+        length doesn't match 3*n, e.g. no previous fit exists yet or the
+        neighboring step's fit failed.
     """
     mid = len(X) // 2
     flip = X[0] > X[-1] if len(X) > 1 else False
     if flip:
         X, Y = X[::-1], Y[::-1]
 
-    smooth = max(1, min(30, len(X)//10)) if n > 1 else 1
+    # Smoothing is only meant to suppress single-point noise spikes before
+    # ranking candidates by prominence, not to reshape the spectrum. The
+    # previous len(X)//10 formula (10 points for a typical ~100-point
+    # window) was heavy enough to fully erase a real but subtle shoulder
+    # feature as a detectable local maximum — not just de-prioritize it —
+    # which left find_peaks seeing only the single dominant hump and no
+    # candidate anywhere near the second component, regardless of seeding
+    # strategy. Capping at 3 was verified empirically to still resolve a
+    # genuine shoulder while smoothing away single-sample noise.
+    smooth = max(1, min(3, len(X)//30)) if n > 1 else 1
     pos, proms, wids = _find_peaks_sorted(Y, X, n_smooth=smooth)
     if len(pos) == 0:
         pos = X[np.argmax(Y):np.argmax(Y)+1]
@@ -544,16 +694,62 @@ def _fit_gauss(X, Y, n=1):
         wids = np.array([(X[-1]-X[0])/4])
 
     n_found = min(n, len(pos))
+    x_lo, x_hi = float(X[0]), float(X[-1])
+    x_range = x_hi - x_lo
+
+    # Minimum resolvable width: a Gaussian narrower than ~1.5 samples is
+    # numerically decoupled from the data (its contribution to any actual
+    # sampled point is negligible), which makes its amplitude essentially
+    # unconstrained/unstable and lets curve_fit park it anywhere with any
+    # amplitude at zero cost — exactly the degenerate "ghost component"
+    # failure mode this floor exists to rule out.
+    dx = float(np.median(np.diff(X))) if len(X) > 1 else x_range or 1.0
+    c_floor = max(1.5 * dx / (2 * np.sqrt(np.log(2))), 1e-6)
+
+    prev_valid = prev_popt is not None and len(prev_popt) == 3 * n
+    if prev_valid:
+        prev_centers = [float(prev_popt[3*k+1]) for k in range(n)]
+        prev_areas = [abs(prev_popt[3*k] * prev_popt[3*k+2]) for k in range(n)]
+        total_prev_area = sum(prev_areas)
+        prev_reliable = [total_prev_area > 0 and a >= 0.02 * total_prev_area
+                          for a in prev_areas]
+        match = _match_to_previous(prev_centers, list(pos))
+
+    y_scale = float(np.max(Y)) if len(Y) else 0.0
     p0, lo, hi = [], [], []
     for i in range(n):
         idx = i % n_found
         a0 = float(proms[idx])
-        b0 = float(pos[idx])
-        c0 = float(wids[idx]) / (2 * np.sqrt(np.log(2)))
-        c0 = max(c0, 1e-6)
+        if prev_valid and match[i] is not None and prev_reliable[i]:
+            # Seed from the previous step's OWN amplitude, not the
+            # amplitude of whichever candidate happened to be nearest —
+            # adjacent power steps are close enough that amplitude is a
+            # reasonable warm-start, and the matched candidate can be an
+            # unrelated low-prominence noise point when this step's own
+            # (still-smoothed) data doesn't clearly show this component.
+            # The bound below is still generously tied to y_scale, so a
+            # genuine intensity change is not prevented, just not required
+            # to start from an arbitrarily tiny/irrelevant guess.
+            a0 = float(abs(prev_popt[3*i]))
+            b0 = float(np.clip(prev_centers[i], x_lo, x_hi))
+            c0 = float(np.clip(abs(prev_popt[3*i+2]), c_floor, max(x_range, c_floor)))
+        else:
+            b0 = float(pos[idx])
+            c0 = float(wids[idx]) / (2 * np.sqrt(np.log(2)))
+            c0 = max(c0, c_floor)
         p0 += [a0, b0, c0]
-        lo += [0, float(X[0]), 0]
-        hi += [a0 * 1.5, float(X[-1]), float(X[-1] - X[0])]
+        lo += [0, x_lo, c_floor]
+        # Bound the amplitude by the window's own signal scale, not just
+        # this slot's seed a0: a0 can come from a matched candidate's
+        # prominence (find_peaks' local "height above nearest saddle",
+        # not the true component amplitude) or from a nearby but
+        # unrelated low-prominence noise peak when nothing real is
+        # detectable near a trusted previous position in this step's own
+        # (over-)smoothed data. Either way, capping the bound at a0*1.5
+        # can make the true amplitude mathematically unreachable even
+        # though the seeded center/width are good — silently guaranteeing
+        # that component collapses regardless of how it was seeded.
+        hi += [max(a0, y_scale) * 1.5, x_hi, max(x_range, c_floor)]
 
     model = _gauss_n_model(n)
     try:
@@ -564,9 +760,21 @@ def _fit_gauss(X, Y, n=1):
             X = X[::-1]
         return None, None, mid, np.nan
 
-    amplitudes = [popt[3*i] for i in range(n)]
-    best = int(np.argmax(amplitudes))
-    b_best = popt[3*best + 1]
+    # Track the midpoint between the leftmost and rightmost REAL
+    # (non-degenerate) sub-peak centers rather than the single
+    # "strongest" component's own center (see fit_nw's own copy of this
+    # logic — this function's own peakindex is superseded by that copy
+    # for every fit that converges, kept in sync mostly for consistency).
+    # "Real" excludes near-zero-area components (<2% of total area, same
+    # threshold used for prev-fit seeding above) so one collapsed
+    # component sitting out at the window edge can't single-handedly
+    # drag the anchor there. For n==1 this is just that peak's center.
+    areas = np.array([abs(popt[3*i] * popt[3*i+2]) for i in range(n)])
+    centers = np.array([popt[3*i+1] for i in range(n)])
+    total_area = areas.sum()
+    real_mask = (areas >= 0.02 * total_area) if total_area > 0 else np.ones(n, dtype=bool)
+    real_centers = centers[real_mask] if np.any(real_mask) else centers
+    b_best = (real_centers.min() + real_centers.max()) / 2.0
     if flip:
         X = X[::-1]
     peakindex = int(np.argmin(np.abs(X - b_best)))
@@ -574,17 +782,28 @@ def _fit_gauss(X, Y, n=1):
     return popt, pcov, peakindex, findpeaks_fwhm
 
 
-def _fit_lorentz(X, Y, n=1):
+def _fit_lorentz(X, Y, n=1, prev_popt=None):
     """
     Fit n Lorentzians to (X, Y).  Returns (popt, pcov, peakindex, findpeaks_fwhm).
     Model per peak: (A, FWHM, center).
+
+    prev_popt : see _fit_gauss — same nearest-neighbor seeding strategy,
+        matched on center (param index 2), warm-starting center/FWHM
+        (index 1) of each component; amplitude still comes from this
+        step's own data. A previous component whose A (already an area,
+        for this model) was negligible relative to that fit's total is
+        not trusted as a seed — same width-floor/ghost-component rationale
+        as _fit_gauss.
     """
     mid = len(X) // 2
     flip = X[0] > X[-1] if len(X) > 1 else False
     if flip:
         X, Y = X[::-1], Y[::-1]
 
-    pos, proms, wids = _find_peaks_sorted(Y, X, n_smooth=max(1, len(X)//20))
+    # See _fit_gauss: capped much lighter than the old len(X)//20 formula,
+    # which was heavy enough to erase a genuine subtle shoulder feature as
+    # a detectable local maximum entirely.
+    pos, proms, wids = _find_peaks_sorted(Y, X, n_smooth=max(1, min(3, len(X)//30)))
     if len(pos) == 0:
         pos = X[np.argmax(Y):np.argmax(Y)+1]
         proms = np.array([max(Y)])
@@ -592,15 +811,41 @@ def _fit_lorentz(X, Y, n=1):
 
     n_found = min(n, len(pos))
     x_range = float(X[-1] - X[0])
+    x_lo, x_hi = float(X[0]), float(X[-1])
+
+    # See _fit_gauss: a FWHM narrower than ~1.5 samples decouples the
+    # component from the data, letting A run away in an unconstrained
+    # direction at zero cost.
+    dx = float(np.median(np.diff(X))) if len(X) > 1 else x_range or 1.0
+    f_floor = max(1.5 * dx, 1e-6)
+
+    prev_valid = prev_popt is not None and len(prev_popt) == 3 * n
+    if prev_valid:
+        prev_centers = [float(prev_popt[3*k+2]) for k in range(n)]
+        prev_areas = [abs(prev_popt[3*k]) for k in range(n)]  # A is already area
+        total_prev_area = sum(prev_areas)
+        prev_reliable = [total_prev_area > 0 and a >= 0.02 * total_prev_area
+                          for a in prev_areas]
+        match = _match_to_previous(prev_centers, list(pos))
+
+    y_scale = float(np.max(Y)) if len(Y) else 0.0
     p0, lo, hi = [], [], []
     for i in range(n):
         idx = i % n_found
         A0 = float(proms[idx])
-        c0 = float(pos[idx])
-        f0 = max(float(wids[idx]), 1e-6)
+        if prev_valid and match[i] is not None and prev_reliable[i]:
+            A0 = float(abs(prev_popt[3*i]))  # see _fit_gauss: previous step's own value, not a possibly-irrelevant matched candidate's
+            c0 = float(np.clip(prev_centers[i], x_lo, x_hi))
+            f0 = float(np.clip(abs(prev_popt[3*i+1]), f_floor, max(x_range, f_floor)))
+        else:
+            c0 = float(pos[idx])
+            f0 = max(float(wids[idx]), f_floor)
         p0 += [A0, f0, c0]
-        lo += [0, 0, float(X[0])]
-        hi += [A0 * 1.5 * x_range, x_range, float(X[-1])]
+        lo += [0, f_floor, x_lo]
+        # See _fit_gauss: don't let a matched-but-irrelevant (or just low-
+        # prominence) candidate's height cap the amplitude bound below
+        # what the window's own signal scale could support.
+        hi += [max(A0, y_scale) * 1.5 * x_range, max(x_range, f_floor), x_hi]
 
     model = _lorentz_n_model(n)
     try:
@@ -611,38 +856,112 @@ def _fit_lorentz(X, Y, n=1):
             X = X[::-1]
         return None, None, mid, np.nan
 
-    centers = [popt[3*i+2] for i in range(n)]
-    areas   = [popt[3*i]   for i in range(n)]
-    best_c = centers[int(np.argmax(areas))]
+    # See _fit_gauss: midpoint of the leftmost/rightmost REAL sub-peak
+    # centers, not the single strongest component's own center.
+    centers = np.array([popt[3*i+2] for i in range(n)])
+    areas   = np.array([popt[3*i]   for i in range(n)])  # A is already area
+    total_area = areas.sum()
+    real_mask = (areas >= 0.02 * total_area) if total_area > 0 else np.ones(n, dtype=bool)
+    real_centers = centers[real_mask] if np.any(real_mask) else centers
+    best_c = (real_centers.min() + real_centers.max()) / 2.0
     if flip:
         X = X[::-1]
     peakindex = int(np.argmin(np.abs(X - best_c)))
     return popt, pcov, peakindex, float(wids[0]) if len(wids) else np.nan
 
 
-def _run_fit(X, Y, fitfunction):
+def _run_fit(X, Y, fitfunction, prev_popt=None):
     """
     Dispatch to the correct fit function.
     Returns (popt, pcov, peakindex, findpeaks_fwhm, n_peaks, is_lorentz).
+
+    prev_popt : popt from the neighboring power step's fit for this same
+        peak (or None) — forwarded to _fit_gauss/_fit_lorentz to seed
+        center/width continuity across power steps.
     """
     fitfunction = fitfunction.lower()
     is_lorentz = False
     n = 1
     if fitfunction in ('gauss1', 'gauss2', 'gauss3', 'gauss4'):
         n = int(fitfunction[-1])
-        popt, pcov, pi, fw = _fit_gauss(X, Y, n)
+        popt, pcov, pi, fw = _fit_gauss(X, Y, n, prev_popt=prev_popt)
     elif fitfunction == 'lorentz1':
         n = 1
         is_lorentz = True
-        popt, pcov, pi, fw = _fit_lorentz(X, Y, 1)
+        popt, pcov, pi, fw = _fit_lorentz(X, Y, 1, prev_popt=prev_popt)
     elif fitfunction.startswith('lorentz'):
         m = re.search(r'(\d+)$', fitfunction)
         n = int(m.group(1)) if m else 1
         is_lorentz = True
-        popt, pcov, pi, fw = _fit_lorentz(X, Y, n)
+        popt, pcov, pi, fw = _fit_lorentz(X, Y, n, prev_popt=prev_popt)
     else:
-        popt, pcov, pi, fw = _fit_gauss(X, Y, 1)
+        popt, pcov, pi, fw = _fit_gauss(X, Y, 1, prev_popt=prev_popt)
     return popt, pcov, pi, fw, n, is_lorentz
+
+
+def _fit_with_peakwidth_background(X, Y_raw, fitfunction, prev_popt,
+                                     sigma_mult_lo=3.0, sigma_mult_hi=3.0):
+    """
+    Two-pass background + fit for the 'linear_peakwidth' background mode
+    (see _peakwidth_linear_background for the rationale).
+
+    Pass 1: subtract a plain edge-averaged linear background (the
+    existing 'linear' mode) and fit — just to locate each sub-peak's
+    center/width, since _peakwidth_linear_background needs a fit to know
+    where "just outside the peak" even is. There's no way around this
+    chicken-and-egg step short of using a neighboring spectrum's fit,
+    which would defeat the point (this mode exists specifically for
+    when peak width is changing across the power series).
+
+    Pass 2: recompute the background from pass 1's peak center/width via
+    _peakwidth_linear_background, subtract that from the RAW data, and
+    re-fit (seeded from pass 1's popt for a fast, stable second pass).
+
+    Falls back to the pass-1 (plain edge-linear) result untouched if
+    pass 1 fails to converge (nothing to refine from) or pass 2 fails on
+    the refined background (rather than losing the step entirely).
+
+    Returns (X_bg, Y_bg, bg, ref_x, popt, pcov, last_pi, fw, n_sub,
+    is_lorentz) — same shape fit_nw's main loop already expects from a
+    single-pass fit, plus ref_x (see _peakwidth_linear_background /
+    subtract_local_background) for display/QA. popt is None only if
+    pass 1 itself found no window data to fit.
+    """
+    mid = len(X) // 2
+    X_bg0, Y_bg0, bg0, ref_x0 = subtract_local_background(X, Y_raw, 'linear')
+    popt0 = pcov0 = None
+    last_pi0, fw0, n_sub0, is_lorentz0 = mid, np.nan, 1, False
+    if len(Y_bg0) > 3 and np.any(Y_bg0 != 0) and not np.any(np.isnan(Y_bg0)):
+        try:
+            popt0, pcov0, last_pi0, fw0, n_sub0, is_lorentz0 = _run_fit(
+                X_bg0, Y_bg0, fitfunction, prev_popt=prev_popt)
+        except Exception:
+            popt0 = None
+
+    if popt0 is None:
+        return (X_bg0, Y_bg0, bg0, ref_x0, None, None,
+                last_pi0, fw0, n_sub0, is_lorentz0)
+
+    bg, ref_x = _peakwidth_linear_background(X, Y_raw, popt0, n_sub0, is_lorentz0,
+                                              sigma_mult_lo, sigma_mult_hi)
+    X_bg, Y_bg = X, Y_raw - bg
+
+    popt = pcov = None
+    last_pi, fw, n_sub, is_lorentz = last_pi0, fw0, n_sub0, is_lorentz0
+    if len(Y_bg) > 3 and np.any(Y_bg != 0) and not np.any(np.isnan(Y_bg)):
+        try:
+            popt, pcov, last_pi, fw, n_sub, is_lorentz = _run_fit(
+                X_bg, Y_bg, fitfunction, prev_popt=popt0)
+        except Exception:
+            popt = None
+
+    if popt is None:
+        # Pass 2 didn't converge on the refined background -- keep the
+        # pass-1 (plain edge-linear) result rather than losing the step.
+        return (X_bg0, Y_bg0, bg0, ref_x0, popt0, pcov0,
+                last_pi0, fw0, n_sub0, is_lorentz0)
+
+    return X_bg, Y_bg, bg, ref_x, popt, pcov, last_pi, fw, n_sub, is_lorentz
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -766,12 +1085,42 @@ def set_startconditions(nw, window_width, x_unit='eV',
     print(f'set_startconditions: {n_peaks} peak(s) selected.')
 
 
+def _resolve_step_settings(i, fitfunction, subtract_fit_background,
+                            peakwidth_sigma_lo, peakwidth_sigma_hi, overrides):
+    """
+    Per-spectrum override lookup for fit_nw. overrides is a list of
+    dicts, each {'start': int, 'end': int, ...settings...} with a
+    0-based inclusive power-step index range; any settings key absent
+    from an override dict keeps that call's own default for steps in
+    that range (so an override can change just the fit function while
+    leaving the background mode alone, for example). If more than one
+    override's range covers index i, the LAST one in the list wins —
+    simple, predictable "later entries take precedence" semantics,
+    matching how a user would naturally read a top-to-bottom settings
+    table (a later, more specific row overriding an earlier, broader
+    one). Returns (fitfunction, subtract_fit_background,
+    peakwidth_sigma_lo, peakwidth_sigma_hi) for this specific step.
+    """
+    if not overrides:
+        return fitfunction, subtract_fit_background, peakwidth_sigma_lo, peakwidth_sigma_hi
+    for ov in overrides:
+        start = int(ov.get('start', 0))
+        end = int(ov.get('end', start))
+        if start <= i <= end:
+            fitfunction = ov.get('fitfunction', fitfunction)
+            subtract_fit_background = ov.get('subtract_fit_background', subtract_fit_background)
+            peakwidth_sigma_lo = ov.get('peakwidth_sigma_lo', peakwidth_sigma_lo)
+            peakwidth_sigma_hi = ov.get('peakwidth_sigma_hi', peakwidth_sigma_hi)
+    return fitfunction, subtract_fit_background, peakwidth_sigma_lo, peakwidth_sigma_hi
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 8.  fit_nw  —  peak fitting with power-series tracking
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fit_nw(nw, subtract_fit_background='none', fitfunction='gauss1',
-           show_progress=False, fixed_window_below_index=None):
+           show_progress=False, fixed_window_below_index=None,
+           peakwidth_sigma_lo=3, peakwidth_sigma_hi=3, fit_overrides=None):
     """
     Fit peaks across all power steps.
 
@@ -779,11 +1128,26 @@ def fit_nw(nw, subtract_fit_background='none', fitfunction='gauss1',
     - Starts at the manually selected spectrum and works outward in both
       directions (handles lasing burndown).
     - Fit window width is fixed; center tracks the fitted peak position.
+    - Each spectrum's fit is seeded from its already-fit neighbor's popt
+      (center/width per sub-peak, nearest-matched for multi-peak
+      functions) rather than purely from fresh peak-finding on that
+      window; falls back to peak-finding wherever no neighbor has been
+      fit yet or the neighbor's fit failed. See _fit_gauss/_fit_lorentz.
 
     Parameters
     ----------
     nw                        : Nanowire
-    subtract_fit_background   : 'linear', 'constant', 'none', or 'raw'
+    subtract_fit_background   : 'linear', 'constant', 'none', 'raw', or
+        'linear_peakwidth' (opt-in, not a default anywhere in the UI —
+        same linear background as 'linear', but its two reference points
+        are placed at (leftmost/rightmost sub-peak's center ∓/±
+        peakwidth_sigma_lo/_hi * sigma) instead of the fixed window's
+        edges; see _fit_with_peakwidth_background /
+        _peakwidth_linear_background. Two fit passes per spectrum, so
+        noticeably slower — only use it if the peak's width actually
+        changes enough across the power series that the fixed-width
+        window's edges stop being a reliable "outside the peak" proxy at
+        some powers.)
     fitfunction               : 'gauss1'..'gauss4', 'lorentz1', 'lorentz<N>'
     show_progress             : bool — show each fit in a figure
     fixed_window_below_index  : int or None — 0-based power-step index
@@ -794,6 +1158,28 @@ def fit_nw(nw, subtract_fit_background='none', fitfunction='gauss1',
         right at this index and held constant for every lower-power step.
         None (default) reproduces the original behavior: the window
         tracks the fitted peak across the entire power series.
+    peakwidth_sigma_lo/_hi    : int/float, default 3 each — only used by
+        the 'linear_peakwidth' background mode; how many sigma below the
+        leftmost / above the rightmost sub-peak's fitted center the two
+        background reference points are placed. Independent so the two
+        sides can be widened/narrowed separately (e.g. an asymmetric
+        peak, or only one side tending to clip into the peak's wing).
+    fit_overrides             : list of dicts or None — per-spectrum
+        overrides of fitfunction/subtract_fit_background/
+        peakwidth_sigma_lo/_hi for specific power-step ranges, e.g.
+        [{'start': 127, 'end': 175, 'fitfunction': 'gauss3'}] fits
+        gauss3 for steps 128-176 (0-based [127, 175] inclusive) and this
+        call's own `fitfunction` argument for every other step. Any
+        settings key omitted from an override dict keeps this call's
+        own default for steps in that range — an override only needs to
+        specify what it's actually changing. If more than one entry's
+        range covers the same step, the LAST one in the list wins. See
+        _resolve_step_settings. None/[] (default): every step uses this
+        call's own settings uniformly, i.e. the original behavior.
+        Warm-start seeding (prev_popt) across a step where the fit
+        function's sub-peak count changes falls back to fresh
+        peak-finding automatically (a different-length popt can't seed
+        a mismatched model) — no special handling needed at a boundary.
     """
     if nw.start_conditions is None or nw.n_sel_peaks == 0:
         print('fit_nw: run set_startconditions first.')
@@ -813,6 +1199,12 @@ def fit_nw(nw, subtract_fit_background='none', fitfunction='gauss1',
 
     fits = [[None]*n_powers for _ in range(n_peaks)]
     fit_data_arr = [[None]*n_powers for _ in range(n_peaks)]
+    # (x1, x2) background reference-point x-positions per (peak, power
+    # step), or None where the mode has no such two-point concept — see
+    # subtract_local_background / _peakwidth_linear_background. Kept
+    # separate from fit_data_arr (which is n_datapoints-per-cell) since
+    # this is always exactly 2 values.
+    bg_ref_x_arr = [[None]*n_powers for _ in range(n_peaks)]
     peak_max = np.full((n_peaks, n_powers), np.nan)
     peak_int = np.full((n_peaks, n_powers), np.nan)
     findpeaks_fwhm = np.full((n_peaks, n_powers), np.nan)
@@ -839,6 +1231,11 @@ def fit_nw(nw, subtract_fit_background='none', fitfunction='gauss1',
         max_spec_idx = int(round(sc[2]))
         peak_idx_arr = np.zeros(n_powers, dtype=int)
         peak_idx_arr[max_spec_idx] = int(round(sc[0]))
+        # popt from each already-fit neighbor, used to warm-start center/
+        # width for the next spectrum in the tracking order (see
+        # _fit_gauss/_fit_lorentz's prev_popt). None until a neighbor has
+        # been fit, or if that neighbor's fit failed.
+        prev_fit_arr = [None] * n_powers
 
         # Iteration order: start at max_spec_idx, go down then up
         order = list(range(max_spec_idx, -1, -1)) + list(range(max_spec_idx+1, n_powers))
@@ -861,29 +1258,58 @@ def fit_nw(nw, subtract_fit_background='none', fitfunction='gauss1',
             X     = wl[i1:i2+1]
 
             peak_max[j, i] = float(np.nanmax(Y_raw)) if len(Y_raw) else np.nan
+            # Raw counts over the tracked fit window -- deliberately NOT
+            # background-subtracted (this is meant to be the complete sum
+            # of counts within the window, full stop) and computed here,
+            # before any background-mode branching below, so it depends
+            # only on the window (X, Y_raw) and never on the background
+            # subtraction or fit result for this step. Fixed 2026-08:
+            # this used to be trapz(Y_bg, X_bg) -- the *background-
+            # subtracted* data -- which is a different (and, until this
+            # session's window/background hardening, occasionally
+            # jumpier) quantity than "everything in the window", and one
+            # this project's actual intended use for PeakIntegral never
+            # asked for.
+            peak_int[j, i] = float(np.trapz(Y_raw, X)) if len(Y_raw) > 1 else 0.0
 
-            X_bg, Y_bg, bg = subtract_local_background(X, Y_raw,
-                                                        subtract_fit_background
-                                                        if subtract_fit_background != 'raw'
-                                                        else 'none')
-            peak_int[j, i] = float(np.trapz(Y_bg, X_bg)) if len(Y_bg) > 1 else 0.0
+            (step_fitfunction, step_bg, step_sigma_lo, step_sigma_hi) = _resolve_step_settings(
+                i, fitfunction, subtract_fit_background,
+                peakwidth_sigma_lo, peakwidth_sigma_hi, fit_overrides)
+
+            if step_bg == 'linear_peakwidth':
+                (X_bg, Y_bg, bg, ref_x, popt, pcov, last_pi, fw,
+                 n_sub, is_lorentz) = _fit_with_peakwidth_background(
+                    X, Y_raw, step_fitfunction, prev_fit_arr[i],
+                    step_sigma_lo, step_sigma_hi)
+            else:
+                X_bg, Y_bg, bg, ref_x = subtract_local_background(X, Y_raw,
+                                                            step_bg
+                                                            if step_bg != 'raw'
+                                                            else 'none')
+                popt, pcov, last_pi, fw = None, None, fitwindow // 2, np.nan
+                if len(Y_bg) > 3 and np.any(Y_bg != 0) and not np.any(np.isnan(Y_bg)):
+                    try:
+                        popt, pcov, last_pi, fw, n_sub, is_lorentz = _run_fit(
+                            X_bg, Y_bg, step_fitfunction, prev_popt=prev_fit_arr[i])
+                    except Exception:
+                        pass
+
             fit_data_arr[j][i] = np.column_stack([X_bg, Y_bg, bg])
-
-            popt, pcov, last_pi, fw = None, None, fitwindow // 2, np.nan
-            if len(Y_bg) > 3 and np.any(Y_bg != 0) and not np.any(np.isnan(Y_bg)):
-                try:
-                    popt, pcov, last_pi, fw, n_sub, is_lorentz = _run_fit(
-                        X_bg, Y_bg, fitfunction)
-                except Exception:
-                    pass
+            bg_ref_x_arr[j][i] = ref_x
 
             findpeaks_fwhm[j, i] = fw
 
-            # Store fit object as SimpleNamespace with popt/pcov
+            # Store fit object as SimpleNamespace with popt/pcov. Records
+            # step_fitfunction (this step's actually-used setting, which
+            # may differ from the call's own default via fit_overrides),
+            # not the outer default -- so a reader iterating nw.fits
+            # (e.g. analysis.py's Inspect view, or the save routine's new
+            # per-step FitFunctionPerStep dataset) sees the truth for
+            # each individual step, not just the file-wide default.
             if popt is not None:
                 fit_ns = SimpleNamespace(popt=popt, pcov=pcov,
                                          n=n_sub, is_lorentz=is_lorentz,
-                                         fitfunction=fitfunction)
+                                         fitfunction=step_fitfunction)
                 fits[j][i] = fit_ns
 
                 # Extract parameters
@@ -901,13 +1327,32 @@ def fit_nw(nw, subtract_fit_background='none', fitfunction='gauss1',
                 fwhm_cell[j][i]       = pf
                 fwhm_err_cell[j][i]   = pfe
 
-                # Track peak: local index of strongest peak
+                # Track peak: the midpoint between the leftmost and
+                # rightmost REAL (non-degenerate) sub-peak centers, not
+                # whichever single component happens to be "strongest"
+                # this step. Anchoring on the strongest component alone
+                # means the tracked position can jump discontinuously
+                # whenever two components' relative areas cross over
+                # between adjacent power steps (dominance flips), and it
+                # frequently doesn't match where a user's initial manual
+                # click landed on the *combined* multi-peak visual
+                # feature rather than any one component inside it. The
+                # midpoint tracks the peak complex as a whole instead.
+                # "Real" excludes near-zero-area components (<2% of
+                # total area, pa already computed above, same threshold
+                # used for prev-fit seeding) so a collapsed component
+                # sitting out at the window edge can't single-handedly
+                # drag the window there. For a single peak (n_sub==1)
+                # this is identical to that peak's own center, so
+                # gauss1/lorentz1 tracking is unchanged.
                 if is_lorentz:
-                    best_sub = int(np.argmax([popt[3*k] for k in range(n_sub)]))
-                    b_best = popt[3*best_sub + 2]  # center
+                    centers = np.array([popt[3*k+2] for k in range(n_sub)])
                 else:
-                    best_sub = int(np.argmax([popt[3*k] for k in range(n_sub)]))
-                    b_best = popt[3*best_sub + 1]  # center
+                    centers = np.array([popt[3*k+1] for k in range(n_sub)])
+                total_area = np.sum(np.abs(pa))
+                real_mask = (np.abs(pa) >= 0.02 * total_area) if total_area > 0 else np.ones(n_sub, dtype=bool)
+                real_centers = centers[real_mask] if np.any(real_mask) else centers
+                b_best = (real_centers.min() + real_centers.max()) / 2.0
                 last_pi = int(np.argmin(np.abs(wl[i1:i2+1] - b_best)))
 
             else:
@@ -921,15 +1366,31 @@ def fit_nw(nw, subtract_fit_background='none', fitfunction='gauss1',
             # Update peak index for adjacent spectrum
             new_pi = last_pi + peak_idx_arr[i] - fitwindow // 2
             new_pi = int(np.clip(new_pi, 0, n_wl - 1))
-            if i > 0 and i <= max_spec_idx:
+            if i > 0 and i < max_spec_idx:
                 peak_idx_arr[i - 1] = _seed_for(i - 1, new_pi, peak_idx_arr[i])
+                prev_fit_arr[i - 1] = popt
             elif i > max_spec_idx and i + 1 < n_powers:
                 peak_idx_arr[i + 1] = _seed_for(i + 1, new_pi, peak_idx_arr[i])
-            elif i == max_spec_idx and i + 1 < n_powers:
-                seed = (peak_idx_arr[max_spec_idx - 1]
-                        if max_spec_idx > 0
-                        else peak_idx_arr[max_spec_idx])
-                peak_idx_arr[i + 1] = _seed_for(i + 1, seed, peak_idx_arr[i])
+                prev_fit_arr[i + 1] = popt
+            elif i == max_spec_idx:
+                # The very first spectrum processed (the manually selected
+                # one) seeds BOTH neighbors from this same fit — the
+                # descending and ascending branches both start from the
+                # same anchor point. (Previously this used a stale
+                # peak_idx_arr[max_spec_idx-1]/peak_idx_arr[max_spec_idx]
+                # lookup instead of new_pi, and — since the branch above
+                # already matches i == max_spec_idx whenever
+                # max_spec_idx > 0 — never actually ran except when
+                # max_spec_idx == 0, so the ascending branch's first step
+                # silently kept its zero-initialized window position.)
+                if max_spec_idx > 0:
+                    peak_idx_arr[max_spec_idx - 1] = _seed_for(
+                        max_spec_idx - 1, new_pi, peak_idx_arr[i])
+                    prev_fit_arr[max_spec_idx - 1] = popt
+                if max_spec_idx + 1 < n_powers:
+                    peak_idx_arr[max_spec_idx + 1] = _seed_for(
+                        max_spec_idx + 1, new_pi, peak_idx_arr[i])
+                    prev_fit_arr[max_spec_idx + 1] = popt
 
             if show_progress and popt is not None:
                 ax_p[0].cla()
@@ -950,6 +1411,7 @@ def fit_nw(nw, subtract_fit_background='none', fitfunction='gauss1',
 
     nw.fits            = fits
     nw.fit_data        = fit_data_arr
+    nw.bg_ref_x        = bg_ref_x_arr
     nw.peak_maximum    = peak_max
     nw.peak_integral   = peak_int
     nw.findpeaks_fwhm  = findpeaks_fwhm
@@ -959,8 +1421,9 @@ def fit_nw(nw, subtract_fit_background='none', fitfunction='gauss1',
     nw.peak_area_err   = peak_area_err_c
     nw.fwhm            = fwhm_cell
     nw.fwhm_err        = fwhm_err_cell
-    nw.fit_model       = fitfunction
+    nw.fit_model       = fitfunction        # default/fallback setting; see nw.fits[j][i].fitfunction for what a given step actually used
     nw.background_type = subtract_fit_background
+    nw.fit_overrides   = fit_overrides
 
     # Total peak area per power step
     total = np.zeros(n_powers)
@@ -1010,7 +1473,7 @@ def integrate_spectra(nw, center, width, spectrumtype='no_background',
         if len(y) == 0:
             continue
         if subtract_bg:
-            x, y, _ = subtract_local_background(x, y, subtract_bg)
+            x, y, _, _ = subtract_local_background(x, y, subtract_bg)
         if method == 'sum':
             out[i] = float(np.sum(y))
         elif method == 'trapz' and len(y) > 1:

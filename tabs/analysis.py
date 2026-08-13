@@ -2,13 +2,15 @@ import os
 import sys
 import re
 import math
+import json
 import numpy as np
 import h5py
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QLabel,
     QPushButton, QRadioButton, QComboBox, QCheckBox, QLineEdit,
     QFileDialog, QMessageBox, QSizePolicy, QScrollArea, QFrame,
-    QApplication, QDialog,
+    QApplication, QDialog, QSpinBox, QTableWidget, QTableWidgetItem,
+    QHeaderView,
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
@@ -284,9 +286,53 @@ class AnalysisTab(QWidget):
         r_bg = QHBoxLayout()
         r_bg.addWidget(QLabel("Background:"))
         self._ana_fitbg = QComboBox()
-        self._ana_fitbg.addItems(["linear", "none", "constant", "raw"])
+        self._ana_fitbg.addItems(["linear", "none", "constant", "raw", "linear_peakwidth"])
+        # "linear_peakwidth" added last so "linear" (index 0) stays the
+        # default selection -- opt-in only.
+        self._ana_fitbg.setItemData(
+            self._ana_fitbg.count() - 1,
+            "Linear background, but anchored just outside the fitted "
+            "peak(s) (center ∓/± the sigma multipliers set below, "
+            "leftmost/rightmost sub-peak for gauss2+/lorentz2+) instead of "
+            "the fixed window's edges. Two fitting passes per spectrum: an "
+            "initial fit (using plain edge-based 'linear') locates the "
+            "peak(s), then the background is recomputed from "
+            "peak-width-relative reference points and the final fit "
+            "re-run on that. Slower, and only helps when peak width "
+            "changes enough across the power series that a fixed-width "
+            "window's edges stop being a good proxy for 'outside the "
+            "peak' at some powers.",
+            Qt.ToolTipRole,
+        )
         r_bg.addWidget(self._ana_fitbg)
         fitl.addLayout(r_bg)
+
+        r_pw = QHBoxLayout()
+        r_pw.addWidget(QLabel("linear_peakwidth: lower/upper ref. = center ∓/±"))
+        self._ana_pw_sigma_lo = QSpinBox()
+        self._ana_pw_sigma_lo.setRange(1, 10)
+        self._ana_pw_sigma_lo.setValue(3)
+        self._ana_pw_sigma_lo.setSuffix("σ")
+        self._ana_pw_sigma_lo.setToolTip(
+            "Only used by the 'linear_peakwidth' background mode. How many "
+            "sigma below the leftmost sub-peak's fitted center the lower "
+            "background reference point is placed. Integer multiples of "
+            "sigma only."
+        )
+        r_pw.addWidget(self._ana_pw_sigma_lo)
+        r_pw.addWidget(QLabel("/"))
+        self._ana_pw_sigma_hi = QSpinBox()
+        self._ana_pw_sigma_hi.setRange(1, 10)
+        self._ana_pw_sigma_hi.setValue(3)
+        self._ana_pw_sigma_hi.setSuffix("σ")
+        self._ana_pw_sigma_hi.setToolTip(
+            "Only used by the 'linear_peakwidth' background mode. How many "
+            "sigma above the rightmost sub-peak's fitted center the upper "
+            "background reference point is placed. Integer multiples of "
+            "sigma only."
+        )
+        r_pw.addWidget(self._ana_pw_sigma_hi)
+        fitl.addLayout(r_pw)
 
         r_fw = QHBoxLayout()
         r_fw.addWidget(QLabel("Fix window below spectrum index:"))
@@ -304,6 +350,40 @@ class AnalysisTab(QWidget):
         fitl.addLayout(r_fw)
 
         dl.addWidget(g_fit)
+
+        # Per-spectrum fit-setting overrides
+        g_ov = QGroupBox("Per-spectrum overrides (optional)")
+        ovl = QVBoxLayout(g_ov)
+        ov_hint = QLabel(
+            "Override Function/Background above for specific power-step "
+            "ranges (1-based, inclusive — matching the step numbers shown "
+            "elsewhere in this tab). Steps not covered by any row below "
+            "use the Function/Background set above. If rows overlap, the "
+            "LOWER row wins."
+        )
+        ov_hint.setWordWrap(True)
+        ovl.addWidget(ov_hint)
+
+        self._ana_override_table = QTableWidget(0, 4)
+        self._ana_override_table.setHorizontalHeaderLabels(
+            ["From step", "To step", "Function", "Background"]
+        )
+        self._ana_override_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.Stretch
+        )
+        self._ana_override_table.setMaximumHeight(140)
+        ovl.addWidget(self._ana_override_table)
+
+        r_ov_btn = QHBoxLayout()
+        btn_ov_add = QPushButton("+ Add range")
+        btn_ov_rm  = QPushButton("− Remove selected")
+        btn_ov_add.clicked.connect(self._ana_add_override_row)
+        btn_ov_rm.clicked.connect(self._ana_remove_override_row)
+        r_ov_btn.addWidget(btn_ov_add)
+        r_ov_btn.addWidget(btn_ov_rm)
+        ovl.addLayout(r_ov_btn)
+
+        dl.addWidget(g_ov)
 
         # thresholds settings
         g_thr = QGroupBox("Find thresholds — mode")
@@ -327,6 +407,57 @@ class AnalysisTab(QWidget):
 
     def _ana_open_settings(self):
         self._ana_settings_dialog.exec_()
+
+    # ── Analysis: per-spectrum fit overrides ──────────────────────
+
+    def _ana_add_override_row(self):
+        row = self._ana_override_table.rowCount()
+        self._ana_override_table.insertRow(row)
+        self._ana_override_table.setItem(row, 0, QTableWidgetItem("1"))
+        self._ana_override_table.setItem(row, 1, QTableWidgetItem("1"))
+        fn_combo = QComboBox()
+        fn_combo.addItems(
+            ["gauss1", "gauss2", "gauss3", "gauss4", "lorentz1", "lorentz2"]
+        )
+        self._ana_override_table.setCellWidget(row, 2, fn_combo)
+        bg_combo = QComboBox()
+        bg_combo.addItems(
+            ["(default)", "linear", "none", "constant", "raw", "linear_peakwidth"]
+        )
+        self._ana_override_table.setCellWidget(row, 3, bg_combo)
+
+    def _ana_remove_override_row(self):
+        row = self._ana_override_table.currentRow()
+        if row >= 0:
+            self._ana_override_table.removeRow(row)
+
+    def _ana_collect_overrides(self):
+        """Read the per-spectrum override table into the list-of-dicts
+        shape nw_analysis.fit_nw's fit_overrides expects, converting
+        1-based inclusive UI step numbers to 0-based indices. Returns
+        None if any row's From/To step isn't a positive integer (the
+        caller should treat that as invalid input, matching the
+        existing 'Fix window below spectrum index' validation style)."""
+        overrides = []
+        for row in range(self._ana_override_table.rowCount()):
+            from_item = self._ana_override_table.item(row, 0)
+            to_item   = self._ana_override_table.item(row, 1)
+            try:
+                start = int(from_item.text()) - 1
+                end   = int(to_item.text()) - 1
+            except (AttributeError, ValueError):
+                return None
+            if start < 0 or end < 0:
+                return None
+            if end < start:
+                start, end = end, start
+            fn_combo = self._ana_override_table.cellWidget(row, 2)
+            bg_combo = self._ana_override_table.cellWidget(row, 3)
+            ov = {"start": start, "end": end, "fitfunction": fn_combo.currentText()}
+            if bg_combo.currentText() != "(default)":
+                ov["subtract_fit_background"] = bg_combo.currentText()
+            overrides.append(ov)
+        return overrides
 
     # ── Analysis: file loading ────────────────────────────────────
 
@@ -779,6 +910,15 @@ class AnalysisTab(QWidget):
                 )
                 return
 
+        overrides = self._ana_collect_overrides()
+        if overrides is None:
+            QMessageBox.warning(
+                self, "Invalid input",
+                "Per-spectrum overrides: 'From step'/'To step' must be "
+                "positive integers (1-based)."
+            )
+            return
+
         parent = self.parent()
         if parent is not None and hasattr(parent, "statusBar"):
             parent.statusBar().showMessage("Fitting… please wait.")
@@ -788,7 +928,10 @@ class AnalysisTab(QWidget):
                        subtract_fit_background=subtract_bg,
                        fitfunction=fitfunction,
                        show_progress=False,
-                       fixed_window_below_index=fixed_window_below)
+                       fixed_window_below_index=fixed_window_below,
+                       peakwidth_sigma_lo=self._ana_pw_sigma_lo.value(),
+                       peakwidth_sigma_hi=self._ana_pw_sigma_hi.value(),
+                       fit_overrides=overrides)
         except Exception as exc:
             QMessageBox.critical(self, "fit_nw error", str(exc))
             return
@@ -824,17 +967,32 @@ class AnalysisTab(QWidget):
         if nw is None:
             return
         spectype = "no_background"
-        method   = "trapz"
 
         # Reset specsum so repeated clicks don't accumulate entries.
         nw.specsum = []
 
         if nw.start_conditions is not None:
-            # ── Per-peak tracking path (mirrors MATLAB fit_nw) ───────
-            # Window width is fixed per peak; center follows the peak as
-            # it shifts spectrally across power steps.
+            # ── specsum: sum of the ENTIRE spectrum at each power step ──
+            # A single, peak/window-independent series plotted alongside
+            # "peak N integral" (nw.peak_integral) on the L-L curve, for
+            # comparing a given peak's own windowed trend against the
+            # total signal across the whole spectrum.
+            #
+            # Fixed 2026-08: this used to independently re-track a
+            # per-peak WINDOW (raw-argmax re-centering, no local
+            # background subtraction — see the peak_integral fix in
+            # nw_analysis.py for why that tracking approach is fragile)
+            # and sum only within that window, one entry per peak — i.e.
+            # it duplicated what PeakIntegral is for instead of being the
+            # distinct "whole spectrum" quantity it's actually meant to
+            # be. Now computed once (not per peak — summing the entire
+            # spectrum doesn't depend on which peak/window is selected)
+            # as a single trapezoidal integral over the full wavelength
+            # axis per power step. No background subtraction here either
+            # — same "sum of what's actually there" intent as
+            # PeakIntegral, just over the whole spectrum instead of one
+            # peak's window.
             n_peaks  = nw.n_sel_peaks
-            n_wl     = nw.wavelength.shape[0]
             n_powers = len(nw.power)
             wl       = nw.wavelength  # nm, shape (n_wl,)
 
@@ -842,57 +1000,18 @@ class AnalysisTab(QWidget):
             if spectra is None:
                 return
 
-            peak_integral = np.full((n_peaks, n_powers), np.nan)
+            full_vals = np.full(n_powers, np.nan)
+            for i in range(n_powers):
+                val = float(np.trapz(spectra[:, i].astype(float), wl))
+                full_vals[i] = np.nan if val == 0 else val
+            nw.specsum.append(dict(
+                values=full_vals,
+                label="full spectrum",
+                spectrumtype=spectype,
+            ))
 
-            for j in range(n_peaks):
-                center_idx = int(round(float(nw.start_conditions[0, j])))
-                fitwindow  = int(round(float(nw.start_conditions[1, j])))
-                fitwindow  = max(2 * (fitwindow // 2), 2)   # keep even, min 2
-                ref_idx    = int(round(float(nw.start_conditions[2, j])))
-                ref_idx    = max(0, min(ref_idx, n_powers - 1))
-
-                peakindex = np.zeros(n_powers, dtype=int)
-                peakindex[ref_idx] = center_idx
-                if ref_idx + 1 < n_powers:
-                    peakindex[ref_idx + 1] = center_idx
-
-                backward = list(range(ref_idx, -1, -1))
-                forward  = list(range(ref_idx + 1, n_powers))
-
-                for i in backward + forward:
-                    i1 = max(0, peakindex[i] - fitwindow // 2)
-                    i2 = min(n_wl, peakindex[i] + fitwindow // 2)
-                    if i2 <= i1:
-                        continue
-
-                    wl_seg = wl[i1:i2]
-                    y_seg  = spectra[i1:i2, i].astype(float)
-
-                    if method == 'sum' or len(wl_seg) < 2:
-                        val = float(np.sum(y_seg))
-                    elif method == 'trapz':
-                        val = float(np.trapz(y_seg, wl_seg))
-                    else:
-                        val = float(np.sum(y_seg * np.gradient(wl_seg)))
-                    peak_integral[j, i] = np.nan if val == 0 else val
-
-                    next_center = i1 + int(np.argmax(y_seg))
-                    if 0 < i <= ref_idx:
-                        peakindex[i - 1] = next_center
-                    elif i > ref_idx and i + 1 < n_powers:
-                        peakindex[i + 1] = next_center
-
-                i1_r = max(0, center_idx - fitwindow // 2)
-                i2_r = min(n_wl - 1, center_idx + fitwindow // 2)
-                nw.specsum.append(dict(
-                    values=peak_integral[j, :].copy(),
-                    center=float(wl[center_idx]) if 0 <= center_idx < n_wl else 0.0,
-                    width=float(abs(wl[i2_r] - wl[i1_r])) if i2_r > i1_r else 0.0,
-                    spectrumtype=spectype,
-                ))
-
-            nw.peak_integral = peak_integral
-            n_valid = int(np.sum(~np.isnan(peak_integral)))
+            pi = getattr(nw, "peak_integral", None)
+            n_valid = int(np.sum(~np.isnan(pi))) if pi is not None else 0
             msg = (f"Analysis: fit + integration done "
                    f"({n_peaks} peak(s), {n_valid}/{n_peaks * n_powers} valid).")
 
@@ -1192,12 +1311,19 @@ class AnalysisTab(QWidget):
                 vals  = entry["values"]
                 valid = ~np.isnan(vals)
                 if valid.any():
-                    c = entry["center"]; w = entry["width"]
+                    # "label" (added 2026-08, specsum is now the whole
+                    # spectrum's sum, not a peak-specific window) falls
+                    # back to the old "@ center ±width" format for any
+                    # legacy entry that still carries those keys instead.
+                    label = entry.get("label")
+                    if label is None:
+                        c = entry.get("center", 0.0); w = entry.get("width", 0.0)
+                        label = f"integrate @ {c:.4g} ±{w/2:.3g}"
                     color = TAB10[color_idx % 10]
                     ax.plot(power[valid], vals[valid],
                             pen=pg.mkPen(color, width=1.2, style=Qt.DashLine),
                             symbol="s", symbolSize=6, symbolBrush=color,
-                            name=f"integrate @ {c:.4g} ±{w/2:.3g}")
+                            name=label)
                     color_idx += 1
                     plotted = True
 
@@ -1322,10 +1448,35 @@ class AnalysisTab(QWidget):
             order_win = np.argsort(x_win)
             x_win_s   = x_win[order_win]
             y_raw_win = (Y_bg + bg)[order_win]
+            bg_win_s  = bg[order_win]
 
             # Highlight the windowed raw data on top of the full spectrum
             ax.plot(x_win_s, y_raw_win, pen=pg.mkPen("orange", width=2.0),
                     symbol="o", symbolSize=5, symbolBrush="orange")
+
+            # The local background curve that was subtracted before fitting
+            # (raw counts, same units as the curves above — not the
+            # zero-centered version the fit itself saw).
+            ax.plot(x_win_s, bg_win_s,
+                    pen=pg.mkPen("yellow", width=1.2, style=Qt.DashLine))
+
+            # The two reference-point x-positions the background line's
+            # endpoints were averaged from — either the fixed window's
+            # edges ('linear') or peak-center ± 3σ ('linear_peakwidth');
+            # see subtract_local_background / _peakwidth_linear_background.
+            # None for background modes with no such two-point concept
+            # ('none', 'constant', 'raw') or if the window was too short.
+            ref_x = (nw.bg_ref_x[j][i]
+                     if getattr(nw, "bg_ref_x", None) is not None else None)
+            if ref_x is not None:
+                for k, x_ref in enumerate(ref_x):
+                    x_ref_disp = float(self._ana_x_of_wl(x_ref))
+                    ax.addItem(pg.InfiniteLine(
+                        pos=x_ref_disp, angle=90,
+                        pen=pg.mkPen("yellow", width=1.0, style=Qt.DotLine),
+                        label=f"bg ref {k+1}",
+                        labelOpts={"position": 0.05 + 0.08*k, "color": "yellow"},
+                    ))
 
             # Shade the fit interval (static replay — not draggable here)
             lo_disp, hi_disp = float(np.min(x_win_s)), float(np.max(x_win_s))
@@ -1517,6 +1668,48 @@ class AnalysisTab(QWidget):
                     except Exception:
                         pass
 
+                # ── FitFunctionPerStep: (n_peaks, n_powers) strings ───
+                # Added 2026-08 alongside per-spectrum fit-setting
+                # overrides. The group-level "FitFunction" attribute is
+                # only the default/fallback setting — if overrides made
+                # different power steps use different fit functions
+                # (different n_sub, or gauss vs lorentz), a reader needs
+                # to know THIS to correctly interpret each step's
+                # (possibly NaN-padded, see FitParameters above) row —
+                # a wrong n_sub would misread real values as padding or
+                # vice versa. Falls back to the group default for any
+                # step whose fit didn't converge (nothing was actually
+                # used, but harmless: FitParameters for that step is all
+                # NaN so nothing tries to interpret it against this).
+                if fits is not None:
+                    try:
+                        n_pk = len(fits); n_pw = len(fits[0]) if n_pk > 0 else 0
+                        fn_arr = np.full((n_pk, n_pw), fit_fn, dtype=object)
+                        for j, peak_fits in enumerate(fits):
+                            for i, fit_ns in enumerate(peak_fits):
+                                if fit_ns is not None:
+                                    fn_arr[j, i] = getattr(fit_ns, "fitfunction", fit_fn) or fit_fn
+                        ds = grp.create_dataset(
+                            "FitFunctionPerStep", data=fn_arr,
+                            dtype=h5py.string_dtype(encoding="utf-8"),
+                        )
+                        ds.attrs["description"] = (
+                            "peaks x powers: fit function actually used at each step "
+                            "(may differ from the group's default 'FitFunction' "
+                            "attribute if per-spectrum overrides were used)"
+                        )
+                    except Exception:
+                        pass
+
+                # ── FitOverrides: JSON string attribute ───────────
+                # The per-spectrum override settings as configured (not
+                # resolved per-step — FitFunctionPerStep above already
+                # has that) — kept for provenance/documentation, e.g. so
+                # re-opening this file later shows what was actually
+                # configured, not just its effect.
+                overrides = getattr(nw, "fit_overrides", None)
+                grp.attrs["FitOverrides"] = json.dumps(overrides or [])
+
                 # ── FitWindowX / FitWindowRawY / BackgroundData: (n_peaks, n_powers, n_datapoints) ──
                 # fit_data[j][i] holds 3 columns per (peak, power step): the
                 # window's x-positions (nm), the background-subtracted y used
@@ -1570,6 +1763,35 @@ class AnalysisTab(QWidget):
                                 "peaks x powers x datapoints: local background curve "
                                 "subtracted before fitting"
                             )
+                    except Exception:
+                        pass
+
+                # ── BackgroundRefX: (n_peaks, n_powers, 2) ────────
+                # The two x-positions the background line's endpoints were
+                # averaged from (window edges for 'linear', peak center ±
+                # 3σ for 'linear_peakwidth') — lets a reader (this tab's
+                # own Inspect view, or the Visualizer's saved-file replica
+                # of it) mark exactly where the background was anchored,
+                # not just draw the resulting line. NaN where a step has
+                # no such two-point concept (e.g. 'none'/'constant', or a
+                # window too short to average). Added alongside the
+                # 'linear_peakwidth' background mode (2026-08); older
+                # saved files simply won't have this dataset.
+                bg_ref_x = getattr(nw, "bg_ref_x", None)
+                if bg_ref_x is not None:
+                    try:
+                        n_pk = len(bg_ref_x); n_pw = len(bg_ref_x[0]) if n_pk > 0 else 0
+                        refx_arr = np.full((n_pk, n_pw, 2), np.nan)
+                        for j, peak_refs in enumerate(bg_ref_x):
+                            for i, ref in enumerate(peak_refs):
+                                if ref is not None:
+                                    refx_arr[j, i, :] = [float(ref[0]), float(ref[1])]
+                        ds = grp.create_dataset("BackgroundRefX", data=refx_arr)
+                        ds.attrs["units"] = "nm"
+                        ds.attrs["description"] = (
+                            "peaks x powers x 2: x-positions the background line's "
+                            "two endpoints were averaged from"
+                        )
                     except Exception:
                         pass
 

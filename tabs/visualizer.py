@@ -11,6 +11,7 @@ from PyQt5.QtWidgets import (
     QAbstractItemView, QFrame, QDialog,
 )
 from PyQt5.QtGui import QFont
+from PyQt5.QtCore import Qt
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from plotting import (
@@ -85,6 +86,8 @@ class VisualizerTab(QWidget):
         self._vis_ps_insp_win_x      = None   # (n_peaks, n_powers, n_pts) nm
         self._vis_ps_insp_win_rawy   = None
         self._vis_ps_insp_bg         = None
+        self._vis_ps_insp_bg_ref_x   = None    # (n_peaks, n_powers, 2) nm, or None (older files)
+        self._vis_ps_insp_fit_fn_per_step = None  # (n_peaks, n_powers) str, or None (older files)
         self._vis_ps_insp_is_lorentz = False
         self._vis_ps_insp_n_sub      = 1
         self._vis_ps_insp_span       = None
@@ -728,7 +731,23 @@ class VisualizerTab(QWidget):
                 win_x       = agrp["FitWindowX"][:]
                 win_rawy    = agrp["FitWindowRawY"][:]
                 bg          = agrp["BackgroundData"][:]
+                # Optional: added alongside the 'linear_peakwidth' mode
+                # (2026-08) — absent in older saved files, in which case
+                # the Inspect view just skips the reference-point markers.
+                bg_ref_x    = agrp["BackgroundRefX"][:] if "BackgroundRefX" in agrp else None
                 fit_fn_name = agrp.attrs.get("FitFunction", "gauss1")
+                # Optional: added alongside per-spectrum fit-setting
+                # overrides (2026-08) — the group's "FitFunction"
+                # attribute is only the default/fallback; if overrides
+                # made different steps use different fit functions
+                # (different n_sub, or gauss vs lorentz), this per-step
+                # dataset is needed to interpret each step's
+                # FitParameters row correctly. Absent in older files, in
+                # which case every step falls back to the single
+                # group-level default (correct as long as no per-step
+                # overrides were ever used on that file).
+                fit_fn_per_step = (agrp["FitFunctionPerStep"].asstr()[:]
+                                   if "FitFunctionPerStep" in agrp else None)
         except Exception as exc:
             QMessageBox.critical(self, "Read error", f"Could not read:\n{path}\n\n{exc}")
             return
@@ -736,12 +755,14 @@ class VisualizerTab(QWidget):
         m = re.match(r"(gauss|lorentz)(\d+)", str(fit_fn_name))
         self._vis_ps_insp_is_lorentz = bool(m) and m.group(1) == "lorentz"
         self._vis_ps_insp_n_sub      = int(m.group(2)) if m else 1
+        self._vis_ps_insp_fit_fn_per_step = fit_fn_per_step
 
         self._vis_ps_insp_file_idx   = row
         self._vis_ps_insp_fit_params = fit_params
         self._vis_ps_insp_win_x      = win_x
         self._vis_ps_insp_win_rawy   = win_rawy
         self._vis_ps_insp_bg         = bg
+        self._vis_ps_insp_bg_ref_x   = bg_ref_x
         self._vis_ps_insp_peak       = 0
         self._vis_ps_insp_power_idx  = 0
 
@@ -815,6 +836,26 @@ class VisualizerTab(QWidget):
             ax.plot(x_win_ev[order], y_win[order], pen=pg.mkPen("orange", width=2.0),
                     symbol="o", symbolSize=5, symbolBrush="orange")
 
+            # Local background curve + its two reference-point x-positions
+            # (see analysis.py's Inspect view — same overlay, replicated
+            # here from the saved BackgroundData/BackgroundRefX datasets).
+            # BackgroundRefX is optional (added 2026-08 alongside the
+            # 'linear_peakwidth' mode); older files simply won't draw the
+            # reference-point markers.
+            ax.plot(x_win_ev[order], bg_win[order],
+                    pen=pg.mkPen("yellow", width=1.2, style=Qt.DashLine))
+            if self._vis_ps_insp_bg_ref_x is not None:
+                ref_x = self._vis_ps_insp_bg_ref_x[j, i, :]
+                if not np.any(np.isnan(ref_x)):
+                    for k, x_ref_nm in enumerate(ref_x):
+                        x_ref_ev = float(_HC_EV_NM / x_ref_nm)
+                        ax.addItem(pg.InfiniteLine(
+                            pos=x_ref_ev, angle=90,
+                            pen=pg.mkPen("yellow", width=1.0, style=Qt.DotLine),
+                            label=f"bg ref {k+1}",
+                            labelOpts={"position": 0.05 + 0.08*k, "color": "yellow"},
+                        ))
+
             lo_disp, hi_disp = float(np.min(x_win_ev)), float(np.max(x_win_ev))
             self._vis_ps_insp_span = DraggableSpan(ax, color=(0, 150, 0, 60), movable=False)
             self._vis_ps_insp_span.set_range(lo_disp, hi_disp)
@@ -823,10 +864,24 @@ class VisualizerTab(QWidget):
             popt = popt[~np.isnan(popt)]
             converged = popt.size > 0
             if converged:
+                # Use THIS step's own fit function if per-spectrum
+                # overrides were saved (FitFunctionPerStep) -- the
+                # group-level default can be wrong for a step that used
+                # a different function, and a wrong n_sub here would
+                # misinterpret FitParameters' NaN-padding as real values
+                # or vice versa. Falls back to the file-wide default
+                # (self._vis_ps_insp_is_lorentz/_n_sub) for older files.
+                is_lorentz, n_sub = self._vis_ps_insp_is_lorentz, self._vis_ps_insp_n_sub
+                if self._vis_ps_insp_fit_fn_per_step is not None:
+                    step_fn_name = str(self._vis_ps_insp_fit_fn_per_step[j, i])
+                    m_step = re.match(r"(gauss|lorentz)(\d+)", step_fn_name)
+                    if m_step:
+                        is_lorentz = m_step.group(1) == "lorentz"
+                        n_sub = int(m_step.group(2))
                 x_fit_nm = np.linspace(float(x_win_nm.min()), float(x_win_nm.max()), 200)
-                model_fn = (nwa._lorentz_n_model(self._vis_ps_insp_n_sub)
-                            if self._vis_ps_insp_is_lorentz
-                            else nwa._gauss_n_model(self._vis_ps_insp_n_sub))
+                model_fn = (nwa._lorentz_n_model(n_sub)
+                            if is_lorentz
+                            else nwa._gauss_n_model(n_sub))
                 y_fit_bgsub = model_fn(x_fit_nm, *popt)
                 y_fit_raw   = y_fit_bgsub + np.interp(x_fit_nm, x_win_nm, bg_win)
                 x_fit_ev    = _HC_EV_NM / x_fit_nm
