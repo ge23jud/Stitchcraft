@@ -177,17 +177,23 @@ def _write_origin_file(output_path, wl_out, counts_out, header_meta, powers_W):
 def _write_h5_file(output_path, wl_out, counts_diff, counts_raw, header_meta,
                    powers_W, stitched=False, source_datasets=None,
                    dark_by_label=None, spot_diameter_um=None, rep_rate_mhz=None,
-                   power_cal=None):
+                   power_cal=None, baseline_value=None, baseline_range_nm=None):
     """Write a power-series spectrum to HDF5, preserving all .origin metadata.
 
     Structure
     ---------
     /Energy                     float64 (n_wl,)           — eV
-    /SpectraDiff                float64 (n_wl, n_powers)  — dark-subtracted, min→1
+    /SpectraDiff                float64 (n_wl, n_powers)  — dark-subtracted, min→1,
+                                                              baseline-subtracted (if applied)
     /Spectra_raw                float64 (n_wl, n_powers)  — stitched, no dark sub
     /Power_uncalibrated         float64 (n_powers,)       — W
     /hwp_positions              float64 (n_powers,)       — degrees (if available)
     /darkspec                   float64 (n_wl,)           — mean dark (non-stitched only)
+    /Baseline                   float64 (n_powers,)       — one fitted constant per power
+                                                              step, each already subtracted
+                                                              from just that step's SpectraDiff
+                                                              column (only if baseline_value
+                                                              is not None)
     /source_spectra/<label>/    group, one per input file (stitched files only)
         wavelength_nm           float64 (n_wl_i,)
         counts                  float64 (n_wl_i, n_powers)  — raw (not dark-subtracted)
@@ -198,6 +204,16 @@ def _write_h5_file(output_path, wl_out, counts_diff, counts_raw, header_meta,
                 plus one attribute per raw header line, named after its
                 label (e.g. "Measurement type", "Integration time") rather
                 than a generic header_line_N key — see the loop below.
+
+    baseline_value/baseline_range_nm (both optional, and only meaningful
+    together): baseline_value is a (n_powers,) array — one constant per
+    power step, each fit independently (mean counts over a user-picked
+    wavelength range) from that step's own data and already subtracted
+    from just that step's column of counts_diff by the caller. Written
+    here purely as a record of what was subtracted (SpectraDiff itself is
+    already the subtracted array); baseline_range_nm (lo_nm, hi_nm) — the
+    one wavelength range shared by every step's fit — is stored as the
+    dataset's own "FitRange" attribute.
     """
     # Accept wl_out in nm (> 50) or eV (< 50); always save as eV.
     if float(wl_out.min()) < 50.0:          # already eV
@@ -236,6 +252,23 @@ def _write_h5_file(output_path, wl_out, counts_diff, counts_raw, header_meta,
         d_diff.attrs["units"]           = f"Counts/{int_time_str}s"
         d_diff.attrs["axes"]            = "Energy : Power_uncalibrated"
         d_diff.attrs["dark_subtracted"] = "Yes" if has_dark else "No"
+        d_diff.attrs["baseline_subtracted"] = "Yes" if baseline_value is not None else "No"
+
+        if baseline_value is not None:
+            d_bl = f.create_dataset(
+                "Baseline", data=np.asarray(baseline_value, dtype=float)
+            )
+            d_bl.attrs["units"] = f"Counts/{int_time_str}s"
+            d_bl.attrs["description"] = (
+                "(n_powers,): one constant per power step, each fit "
+                "independently (mean counts over a user-picked wavelength "
+                "range, after stitching and dark subtraction) from that "
+                "step's own data and subtracted from just that step's "
+                "SpectraDiff column"
+            )
+            if baseline_range_nm is not None:
+                d_bl.attrs["FitRange"] = list(baseline_range_nm)
+                d_bl.attrs["FitRange_units"] = "nm"
 
         d_raw = f.create_dataset("Spectra_raw", data=counts_raw, compression="gzip")
         d_raw.attrs["units"] = f"Counts/{int_time_str}s"

@@ -1,6 +1,7 @@
 import os
 import sys
 import numpy as np
+import pyqtgraph as pg
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QLabel,
     QPushButton, QRadioButton, QComboBox, QStackedWidget,
@@ -73,6 +74,22 @@ class StitchTab(QWidget):
         self._ps_cal_atsample_data = None   # (hwp_arr, powers_W) or None
         self._ps_cal_atbs_path     = None   # str or None
         self._ps_cal_atsample_path = None   # str or None
+
+        # Baseline subtraction state — applied at the very end, after
+        # stitching and dark subtraction (see _ps_compute_stitch()). One
+        # constant per power step (mean counts over a user-picked range,
+        # fit independently from each step's own data and subtracted only
+        # from that step) — all power steps stay visible while the window
+        # is picked, and every step gets its own fit.
+        self._ps_baseline_range   = None   # (lo_wl, hi_wl) nm, or None until confirmed
+        self._ps_baseline_value   = None   # (n_powers,) fitted constants, or None
+        self._ps_baseline_span    = None   # DraggableSpan, active during selection
+        self._ps_baseline_pending_range = None   # display-domain (xmin,xmax), pending confirm
+        self._ps_baseline_pending_value = None
+        self._ps_baseline_preview_item  = None   # dashed constant-level line during selection
+        self._ps_baseline_stitch_cache  = None   # (wl_out, counts_diff, powers) — pre-baseline,
+                                                   # captured when selection starts
+        self._ps_baseline_prev_mode     = None   # _ps_mode to restore on cancel
 
         # ══════════════════════════════════════════════════════════
         # TRPL (.dat) → HDF5 state  (formerly ConvertTab)
@@ -156,6 +173,24 @@ class StitchTab(QWidget):
         self._ps_nav_bar.setVisible(False)
         rl.addWidget(self._ps_nav_bar)
 
+        # PS baseline-selection action bar (Confirm/Cancel), shared pattern
+        # with the TRPL tab's baseline subtraction — shown only while
+        # self._ps_mode == "baseline_selecting".
+        self._ps_baseline_bar = QFrame()
+        self._ps_baseline_bar.setFrameShape(QFrame.StyledPanel)
+        bb = QHBoxLayout(self._ps_baseline_bar)
+        bb.setContentsMargins(8, 4, 8, 4)
+        self._ps_baseline_action_lbl = QLabel("")
+        self._ps_btn_baseline_confirm = QPushButton("Confirm baseline")
+        self._ps_btn_baseline_cancel  = QPushButton("Cancel")
+        self._ps_btn_baseline_confirm.clicked.connect(self._ps_on_baseline_confirm)
+        self._ps_btn_baseline_cancel.clicked.connect(self._ps_on_baseline_cancel)
+        bb.addWidget(self._ps_baseline_action_lbl, stretch=1)
+        bb.addWidget(self._ps_btn_baseline_confirm)
+        bb.addWidget(self._ps_btn_baseline_cancel)
+        self._ps_baseline_bar.setVisible(False)
+        rl.addWidget(self._ps_baseline_bar)
+
         layout.addWidget(right, stretch=1)
 
         self._ps_refresh_buttons()
@@ -188,6 +223,9 @@ class StitchTab(QWidget):
             if self._ps_span_selector is not None:
                 self._ps_span_selector.deactivate()
                 self._ps_span_selector = None
+            if self._ps_mode == "baseline_selecting":
+                self._ps_on_baseline_cancel()
+            self._ps_baseline_bar.setVisible(False)
             self._stack.setCurrentWidget(self._page_trpl)
             item = self._trpl_file_list.currentItem()
             path = item.data(Qt.UserRole) if item is not None else None
@@ -329,6 +367,32 @@ class StitchTab(QWidget):
         g_cal.setStyleSheet(_COMPACT_BTN_STYLE)
         sl.addWidget(g_cal)
 
+        # Baseline subtraction group — applied at the very end, after
+        # stitching and dark subtraction. Same UX as the TRPL tab's
+        # baseline subtraction: drag a range, a constant (mean counts) is
+        # fit over it and subtracted from every count.
+        g_baseline = QGroupBox("Baseline subtraction")
+        bll = QVBoxLayout(g_baseline)
+        self._ps_btn_baseline_select = QPushButton("Select baseline range…")
+        self._ps_btn_baseline_select.setToolTip(
+            "Drag a range with no signal, on the stitched/dark-subtracted\n"
+            "result (all power steps shown). A separate constant (mean\n"
+            "counts over the range) is fit per power step, from that\n"
+            "step's own data, and subtracted from just that step."
+        )
+        self._ps_btn_baseline_select.setEnabled(False)
+        self._ps_btn_baseline_select.clicked.connect(self._ps_on_start_baseline_select)
+        bll.addWidget(self._ps_btn_baseline_select)
+        self._ps_btn_baseline_reset = QPushButton("Reset baseline")
+        self._ps_btn_baseline_reset.setEnabled(False)
+        self._ps_btn_baseline_reset.clicked.connect(self._ps_on_reset_baseline)
+        bll.addWidget(self._ps_btn_baseline_reset)
+        self._ps_baseline_status_lbl = QLabel("No baseline applied.")
+        self._ps_baseline_status_lbl.setWordWrap(True)
+        bll.addWidget(self._ps_baseline_status_lbl)
+        g_baseline.setStyleSheet(_COMPACT_BTN_STYLE)
+        sl.addWidget(g_baseline)
+
         # Action buttons
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
@@ -417,6 +481,24 @@ class StitchTab(QWidget):
         self._ps_span_selector = None
         self._ps_mode = "idle"
         self._ps_nav_bar.setVisible(False)
+        self._ps_reset_baseline_state()
+
+    def _ps_reset_baseline_state(self):
+        """Discard any baseline selection (confirmed or in progress) — the
+        input files/stitch changed, so a previously-fit constant no longer
+        applies. Called whenever the input file set changes."""
+        self._ps_baseline_range = None
+        self._ps_baseline_value = None
+        self._ps_baseline_pending_range = None
+        self._ps_baseline_pending_value = None
+        self._ps_baseline_stitch_cache = None
+        if self._ps_baseline_span is not None:
+            self._ps_baseline_span.deactivate()
+            self._ps_baseline_span = None
+        self._ps_remove_baseline_preview_item()
+        self._ps_baseline_bar.setVisible(False)
+        self._ps_btn_baseline_reset.setEnabled(False)
+        self._ps_baseline_status_lbl.setText("No baseline applied.")
 
     # ── PS: X-axis toggle ────────────────────────────────────────
 
@@ -1000,11 +1082,34 @@ class StitchTab(QWidget):
     # ── PS: steps 3–5 — Preview / Save ────────────────────────────
 
     def _ps_compute_stitch(self):
+        """_ps_compute_stitch_core() plus baseline subtraction — the very
+        last step, applied after stitching and dark subtraction, if a
+        baseline has been confirmed (see _ps_on_baseline_confirm()). This is
+        the version everything downstream (previews, both Save actions)
+        should call; the baseline selector itself calls
+        _ps_compute_stitch_core() directly so it always starts from the
+        pre-baseline data, never compounding an already-applied baseline.
+
+        self._ps_baseline_value is a (n_powers,) array, one constant per
+        power step — each subtracted only from its own column, not one
+        shared value applied to every step (relies on numpy broadcasting a
+        (n_powers,) array against counts_diff's (n_wl, n_powers) shape).
+        """
+        result = self._ps_compute_stitch_core()
+        if result is None:
+            return None
+        wl_out, counts_diff, counts_raw, ds_raw, best_hdr, dark_by_label = result
+        if self._ps_baseline_value is not None:
+            counts_diff = counts_diff - self._ps_baseline_value
+        return wl_out, counts_diff, counts_raw, ds_raw, best_hdr, dark_by_label
+
+    def _ps_compute_stitch_core(self):
         """Build output data. Dark subtraction (if assigned) always precedes stitching.
 
         Returns (wl_out, counts_diff, counts_raw, ds_raw, best_hdr, dark_by_label)
         or None.
-          counts_diff   — dark-subtracted, min shifted to 1
+          counts_diff   — dark-subtracted, min shifted to 1 (no baseline subtraction —
+                          see _ps_compute_stitch(), the wrapper everything else calls)
           counts_raw    — stitched without dark subtraction, no min-shift
           ds_raw        — original (un-subtracted) source datasets
           dark_by_label — {label: dark_mean_on_file_wl | None}
@@ -1146,6 +1251,8 @@ class StitchTab(QWidget):
                 spot_diameter_um=spot_diam,
                 rep_rate_mhz=rep_rate,
                 power_cal=power_cal,
+                baseline_value=self._ps_baseline_value,
+                baseline_range_nm=self._ps_baseline_range,
             )
         except Exception as exc:
             QMessageBox.critical(self, "Save error", str(exc))
@@ -1153,13 +1260,15 @@ class StitchTab(QWidget):
 
         action = "Stitched" if is_stitched else "Converted"
         dark_note = f", {n_dark}/{len(ds)} dark(s) subtracted" if n_dark > 0 else ""
+        baseline_note = (", per-power-step baseline subtracted"
+                         if self._ps_baseline_value is not None else "")
         parent = self.parent()
         if parent is not None and hasattr(parent, "statusBar"):
             parent.statusBar().showMessage(f"Saved: {out_path}")
         QMessageBox.information(
             self, "Saved",
             f"{action} spectrum ({wl_out.size} wavelengths, "
-            f"{n_p} power steps{dark_note}) saved to:\n\n{out_path}",
+            f"{n_p} power steps{dark_note}{baseline_note}) saved to:\n\n{out_path}",
         )
         title = ("Stitched spectrum (dark-subtracted)"
                  if (is_stitched and n_dark) else
@@ -1226,7 +1335,217 @@ class StitchTab(QWidget):
         ax.setLabel("left", "Counts")
         ax.setTitle(title)
         ax.showGrid(x=True, y=True, alpha=0.3)
+        if self._ps_baseline_range is not None:
+            self._ps_draw_baseline_overlay(ax)
         self._canvas.draw_idle()
+        return ax
+
+    def _ps_draw_baseline_overlay(self, ax):
+        """Shade the wavelength range a confirmed baseline was fit over —
+        same convention as the TRPL tab's confirmed-baseline overlay."""
+        lo_wl, hi_wl = self._ps_baseline_range
+        x_lo = self._ps_wl_to_x(hi_wl if self._ps_x_axis == "energy" else lo_wl)
+        x_hi = self._ps_wl_to_x(lo_wl if self._ps_x_axis == "energy" else hi_wl)
+        if x_lo > x_hi:
+            x_lo, x_hi = x_hi, x_lo
+        region = pg.LinearRegionItem(
+            values=(x_lo, x_hi), orientation="vertical",
+            brush=pg.mkBrush(30, 100, 220, 30), movable=False,
+        )
+        region.setZValue(5)
+        ax.addItem(region)
+
+    # ── PS: baseline subtraction ─────────────────────────────────
+    # Applied at the very end, after stitching and dark subtraction — see
+    # _ps_compute_stitch(). Same "drag a range, fit a constant (mean),
+    # subtract from everything" UX as the TRPL tab's baseline subtraction,
+    # routed through the shared _ps_baseline_bar's Confirm/Cancel buttons.
+    # Unlike the lifetime-fit-vs-baseline mutual exclusion in the TRPL tab,
+    # here it's baseline-selection vs. transition-span-selection that are
+    # mutually exclusive (self._ps_mode == "spans").
+
+    def _ps_remove_baseline_preview_item(self):
+        if self._ps_baseline_preview_item is not None:
+            try:
+                self._canvas.plot_item.removeItem(self._ps_baseline_preview_item)
+            except Exception:
+                pass
+            self._ps_baseline_preview_item = None
+
+    def _ps_on_start_baseline_select(self):
+        if self._ps_mode == "spans":
+            QMessageBox.information(
+                self, "Finish span selection first",
+                "Click \"✓ Done\" to finish selecting transition spans "
+                "before selecting a baseline range."
+            )
+            return
+        if self._ps_mode == "baseline_selecting":
+            return
+
+        # Always compute from the pre-baseline stitch (never the already-
+        # baseline-subtracted result), so re-selecting after a Reset — or
+        # even without one — can't compound an already-applied baseline.
+        result = self._ps_compute_stitch_core()
+        if result is None:
+            return
+        wl_out, counts_diff, _counts_raw, ds, _hdr, _dark = result
+        self._ps_baseline_stitch_cache = (wl_out, counts_diff, ds[0]["powers"])
+
+        self._ps_baseline_prev_mode = self._ps_mode
+        self._ps_mode = "baseline_selecting"
+        self._ps_nav_bar.setVisible(False)
+        self._ps_refresh_buttons()
+
+        ax = self._ps_draw_stitched(wl_out, counts_diff, ds[0]["powers"],
+                                    title="Select baseline range (no signal)")
+        x = self._ps_wl_to_x(wl_out)
+        x_lo, x_hi = float(np.min(x)), float(np.max(x))
+        width = (x_hi - x_lo) * 0.1
+        initial = (x_lo, x_lo + width)
+
+        self._ps_baseline_span = DraggableSpan(ax, color=(30, 100, 220, 60), movable=True)
+        self._ps_baseline_span.activate(initial_range=initial, bounds=(x_lo, x_hi))
+        self._ps_baseline_span.sigRegionSelected.connect(self._ps_on_baseline_span_changed)
+
+        self._ps_btn_baseline_confirm.setEnabled(False)
+        self._ps_baseline_bar.setVisible(True)
+        self._ps_on_baseline_span_changed(*initial)
+
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "statusBar"):
+            parent.statusBar().showMessage(
+                "Drag a range with no signal, then Confirm baseline."
+            )
+
+    def _ps_on_baseline_span_changed(self, xmin, xmax):
+        if xmin > xmax:
+            xmin, xmax = xmax, xmin
+        self._ps_baseline_pending_range = (xmin, xmax)
+
+        wl_out, counts_diff, _powers = self._ps_baseline_stitch_cache
+        x = self._ps_wl_to_x(wl_out)
+        mask = (x >= xmin) & (x <= xmax)
+        n_pts = int(np.sum(mask))
+        if n_pts < 1:
+            self._ps_baseline_pending_value = None
+            self._ps_remove_baseline_preview_item()
+            self._ps_btn_baseline_confirm.setEnabled(False)
+            self._ps_baseline_action_lbl.setText("Baseline range: no points in range — widen it.")
+            return
+
+        # One constant per power step: the mean over the selected range of
+        # that step's own counts — not one shared value averaged across
+        # steps. Every power step's curve is visible while the window is
+        # picked (_ps_draw_stitched), and each step is fit independently
+        # from its own data in that same wavelength range and later
+        # subtracted only from itself (see _ps_compute_stitch()).
+        baseline_arr = counts_diff[mask, :].mean(axis=0)   # (n_powers,)
+        self._ps_baseline_pending_value = baseline_arr
+
+        self._ps_remove_baseline_preview_item()
+        x_curve = np.array([float(np.min(x)), float(np.max(x))])
+        y_curve = np.full(2, baseline_arr[0])   # reference line at the lowest power's own constant
+        self._ps_baseline_preview_item = self._canvas.plot_item.plot(
+            x_curve, y_curve, pen=pg.mkPen("cyan", width=1.5, style=Qt.DashLine)
+        )
+        self._canvas.draw_idle()
+
+        n_p = counts_diff.shape[1]
+        msg = (f"Baseline range: {n_pts} wavelength pt(s) — one constant per "
+               f"power step (lowest power = {baseline_arr[0]:.4g} counts, "
+               f"{n_p} step(s) total)")
+        self._ps_baseline_action_lbl.setText(msg)
+        self._ps_btn_baseline_confirm.setEnabled(True)
+
+    def _ps_on_baseline_confirm(self):
+        if self._ps_mode != "baseline_selecting" or self._ps_baseline_pending_value is None:
+            return
+        xmin, xmax = self._ps_baseline_pending_range
+        wl_out, _counts_diff, _powers = self._ps_baseline_stitch_cache
+        if self._ps_x_axis == "energy":
+            lo_wl = min(_HC_EV_NM / xmin, _HC_EV_NM / xmax)
+            hi_wl = max(_HC_EV_NM / xmin, _HC_EV_NM / xmax)
+        else:
+            lo_wl, hi_wl = min(xmin, xmax), max(xmin, xmax)
+        self._ps_baseline_range = (lo_wl, hi_wl)
+        self._ps_baseline_value = self._ps_baseline_pending_value
+
+        if self._ps_baseline_span is not None:
+            self._ps_baseline_span.deactivate()
+            self._ps_baseline_span = None
+        self._ps_remove_baseline_preview_item()
+        self._ps_baseline_pending_range = None
+        self._ps_baseline_pending_value = None
+        self._ps_baseline_stitch_cache = None
+
+        self._ps_mode = "done"
+        self._ps_baseline_bar.setVisible(False)
+        self._ps_btn_baseline_reset.setEnabled(True)
+        self._ps_refresh_buttons()
+        n_p = len(self._ps_baseline_value)
+        self._ps_baseline_status_lbl.setText(
+            f"Baseline fit per power step over {lo_wl:.5g}–{hi_wl:.5g} nm "
+            f"({n_p} step(s); lowest power = {self._ps_baseline_value[0]:.4g} counts). "
+            "Each step's own constant subtracted from just that step."
+        )
+        self._ps_refresh_result_view()
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "statusBar"):
+            parent.statusBar().showMessage(
+                f"Baseline subtracted per power step ({n_p} step(s))."
+            )
+
+    def _ps_on_baseline_cancel(self):
+        if self._ps_baseline_span is not None:
+            self._ps_baseline_span.deactivate()
+            self._ps_baseline_span = None
+        self._ps_remove_baseline_preview_item()
+        self._ps_baseline_pending_range = None
+        self._ps_baseline_pending_value = None
+        self._ps_baseline_stitch_cache = None
+
+        prev_mode = self._ps_baseline_prev_mode if self._ps_baseline_prev_mode is not None else "done"
+        self._ps_mode = prev_mode
+        self._ps_baseline_bar.setVisible(False)
+        self._ps_refresh_buttons()
+        # Restore whichever view was showing before baseline selection
+        # started, not always the stitched-result view — e.g. canceling
+        # right after step 1 (before ever stitching) should go back to the
+        # simple last-power preview, not jump ahead to the stitched one.
+        if prev_mode == "preview":
+            self._ps_draw_preview()
+        else:
+            self._ps_refresh_result_view()
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "statusBar"):
+            parent.statusBar().showMessage("Baseline selection canceled.")
+
+    def _ps_on_reset_baseline(self):
+        if self._ps_baseline_value is None:
+            return
+        self._ps_baseline_range = None
+        self._ps_baseline_value = None
+        self._ps_btn_baseline_reset.setEnabled(False)
+        self._ps_baseline_status_lbl.setText("No baseline applied.")
+        self._ps_refresh_result_view()
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "statusBar"):
+            parent.statusBar().showMessage("Baseline subtraction reset.")
+
+    def _ps_refresh_result_view(self):
+        """Redraw the stitched-result preview reflecting the current
+        baseline state — used after confirming/canceling/resetting a
+        baseline selection, mirroring _ps_on_preview_result()'s own view."""
+        result = self._ps_compute_stitch()
+        if result is None:
+            return
+        wl_out, counts_out, _counts_raw, ds, _hdr, dark_by_label = result
+        n_dark      = sum(1 for v in dark_by_label.values() if v is not None)
+        is_stitched = len(ds) > 1
+        dark_note   = f" (dark-subtracted: {n_dark}/{len(ds)})" if n_dark else ""
+        base_title  = "Stitched spectrum" if is_stitched else "Spectrum"
+        self._ps_draw_stitched(wl_out, counts_out, ds[0]["powers"], title=base_title + dark_note)
 
     # ── PS: helpers ──────────────────────────────────────────────
 
@@ -1248,6 +1567,7 @@ class StitchTab(QWidget):
         self._ps_btn_remove.setEnabled(has1)
         self._ps_btn_clear.setEnabled(has1)
         self._ps_btn_load_dark.setEnabled(bool(self._ps_datasets))
+        self._ps_btn_baseline_select.setEnabled(has1 and self._ps_mode != "baseline_selecting")
         self._ps_btn_clear_dark.setEnabled(bool(self._ps_dark_map))
 
     # ══════════════════════════════════════════════════════════════

@@ -938,7 +938,7 @@ class VisualizerTab(QWidget):
         self._vis_trpl_chk_fits.toggled.connect(self._vis_trpl_plot)
         sl.addWidget(self._vis_trpl_chk_fits)
 
-        g_life = QGroupBox("Lifetime(s)")
+        g_life = QGroupBox("Lifetime(s) / Total Decay Time")
         ll = QVBoxLayout(g_life)
         self._vis_trpl_lifetime_lbl = QLabel("No files loaded.")
         self._vis_trpl_lifetime_lbl.setWordWrap(True)
@@ -972,27 +972,40 @@ class VisualizerTab(QWidget):
             QMessageBox.warning(self, "Load error", f"Could not load:\n{path}\n\n{exc}")
             return None
 
-        fit_params = fit_ranges = lifetimes = None
+        fit_params = fit_range = lifetimes = total_decay_time = None
         try:
             with h5py.File(path, "r") as f:
                 if "analysis" in f:
                     agrp = f["analysis"]
-                    if "FitParameters" in agrp and "FitRanges" in agrp:
+                    # (2026-08) the TRPL tab switched from N independently
+                    # fit single exponentials (one range each, "FitRanges"
+                    # (n,2)) to a single range holding a sum of N
+                    # exponentials ("FitRange" (2,)) — older files saved
+                    # under the previous schema simply won't have
+                    # "FitRange" and are skipped (their "FitRanges" no
+                    # longer matches this overlay's one-range assumption).
+                    if "FitParameters" in agrp and "FitRange" in agrp:
                         fit_params = agrp["FitParameters"][:]
-                        fit_ranges = agrp["FitRanges"][:]
+                        fit_range = agrp["FitRange"][:]
                     if "Lifetime" in agrp:
                         lifetimes = agrp["Lifetime"][:]
+                    # Added alongside trpl.py's Total_Decay_Time (2026-09);
+                    # absent in older files, in which case it's just omitted
+                    # from the label text below.
+                    if "Total_Decay_Time" in agrp:
+                        total_decay_time = float(agrp["Total_Decay_Time"][()])
         except Exception:
             pass   # fit overlay/lifetime text are optional extras
 
         return {
-            "label":      os.path.splitext(os.path.basename(path))[0],
-            "path":       path,
-            "times":      data["times"],
-            "counts":     data["counts"],
-            "fit_params": fit_params,
-            "fit_ranges": fit_ranges,
-            "lifetimes":  lifetimes,
+            "label":            os.path.splitext(os.path.basename(path))[0],
+            "path":             path,
+            "times":            data["times"],
+            "counts":           data["counts"],
+            "fit_params":       fit_params,
+            "fit_range":        fit_range,
+            "lifetimes":        lifetimes,
+            "total_decay_time": total_decay_time,
         }
 
     def _vis_trpl_on_remove(self):
@@ -1041,26 +1054,33 @@ class VisualizerTab(QWidget):
             mlp.plot(d["times"], d["counts"], index=fi, width=1.0,
                      antialias=False, label=d["label"])
 
-            if show_fits and d["fit_params"] is not None and d["fit_ranges"] is not None:
+            if show_fits and d["fit_params"] is not None and d["fit_range"] is not None:
                 color = pg.mkColor(TAB10[fi % 10])
                 region_color = pg.mkColor(color)
                 region_color.setAlpha(40)
-                for (xmin, xmax), (a, b) in zip(d["fit_ranges"], d["fit_params"]):
-                    region = pg.LinearRegionItem(
-                        values=(float(xmin), float(xmax)), orientation="vertical",
-                        brush=pg.mkBrush(region_color), movable=False,
-                    )
-                    region.setZValue(5)
-                    ax.addItem(region)
-                    x_curve = np.linspace(float(xmin), float(xmax), 200)
-                    y_curve = np.exp(b) * np.exp(a * x_curve)
-                    ax.plot(x_curve, y_curve, pen=pg.mkPen(color, width=1.5))
+                xmin, xmax = (float(v) for v in d["fit_range"])
+                region = pg.LinearRegionItem(
+                    values=(xmin, xmax), orientation="vertical",
+                    brush=pg.mkBrush(region_color), movable=False,
+                )
+                region.setZValue(5)
+                ax.addItem(region)
+                x_curve = np.linspace(xmin, xmax, 200)
+                # Sum of exponentials: one (a, b) row per component, all
+                # sharing this one fit range (see trpl.py's save routine).
+                y_curve = np.zeros_like(x_curve)
+                for a, b in d["fit_params"]:
+                    y_curve = y_curve + a * np.exp(-b * x_curve)
+                ax.plot(x_curve, y_curve, pen=pg.mkPen(color, width=1.5))
 
             if d["lifetimes"] is not None and len(d["lifetimes"]):
                 vals = ", ".join(f"{v:.4g} ns" for v in d["lifetimes"])
-                lifetime_lines.append(f"{d['label']}: {vals}")
+                line = f"{d['label']}: {vals}"
             else:
-                lifetime_lines.append(f"{d['label']}: —")
+                line = f"{d['label']}: —"
+            if d["total_decay_time"] is not None:
+                line += f"  (total decay time: {d['total_decay_time']:.4g} ns)"
+            lifetime_lines.append(line)
 
         ax.setLabel("bottom", "Time (ns)")
         ax.setLabel("left", "Counts")
