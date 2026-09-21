@@ -5,9 +5,9 @@ import h5py
 from scipy.optimize import curve_fit, brentq
 from scipy.signal import fftconvolve
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QLabel,
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QLabel,
     QPushButton, QComboBox, QFileDialog, QMessageBox, QFrame,
-    QScrollArea, QStyle, QDoubleSpinBox, QCheckBox,
+    QScrollArea, QStyle, QDoubleSpinBox, QCheckBox, QDialog,
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
@@ -38,6 +38,24 @@ def _rank_name(rank, n_exp):
     if n_exp == 3:
         return ("slow", "medium", "fast")[rank]
     raise ValueError(f"unsupported n_exp={n_exp}")
+
+
+def _guess_slot_for_stage(idx, n_exp):
+    """Map a fit stage index to one of the 3 fixed "slow"/"medium"/"fast"
+    initial-guess slots the Settings dialog exposes (see TRPLTab._guess_
+    widgets), independent of n_exp — unlike _rank_name's labels (which
+    shift meaning with n_exp, e.g. rank 0 is "slow" for n_exp=2 but the
+    *only* component for n_exp=1), the slot a given stage reads its guess
+    override from stays fixed: the final stage (freely fit, whatever its
+    index) always reads "fast", stage 0 (only present for n_exp >= 2)
+    always reads "slow", and stage 1 (only present for n_exp == 3) always
+    reads "medium". This lets a user's typed-in guesses for e.g. the fast
+    component survive switching the Exponentials combo back and forth."""
+    if idx == n_exp - 1:
+        return "fast"
+    if idx == 0:
+        return "slow"
+    return "medium"
 
 
 def _multiexp(t, *params):
@@ -231,6 +249,33 @@ class TRPLTab(QWidget):
     "Baseline" (scalar) and the subtracted array as "CountsBased" into the
     same "analysis" subgroup.
 
+    Optional per-stage initial-guess override (added 2026-09): by default
+    every stage's free-component p0 for curve_fit comes from
+    _multiexp_initial_guess() (stage 0) or _free_component_initial_guess()
+    (later stages) — both heuristics, not always a good starting point for
+    unusual data. The Settings dialog (see below) offers 3 fixed slots,
+    "slow"/"medium"/"fast" (_guess_slot_for_stage() maps a stage index to
+    one of these independent of n_exp — the final stage always reads
+    "fast", stage 0 always reads "slow", stage 1, n_exp==3 only, always
+    reads "medium" — so a typed guess survives switching the Exponentials
+    combo), each an optional (a0, b0) pair via its own checkbox + two
+    spinboxes. Unchecked (the default) leaves that stage on the automatic
+    heuristic; checked, its (a0, b0) is used verbatim as p0 instead — read
+    once into self._fit_initial_guesses at _on_start_selecting(), same
+    "settings are read at attempt-start, not live" convention as
+    self._n_exp/self._fit_use_irf_convolution, so edits made mid-attempt
+    apply only to the next "Select fit range…".
+
+    All fitting-procedure settings — Exponentials count, "Include IRF
+    convolution", and the initial-guess overrides above — live in a
+    separate non-modal "TRPL Fit Settings" dialog (added 2026-09,
+    self._fit_settings_dialog, opened via the sidebar's "Settings…"
+    button), keeping the sidebar itself down to "Select fit range…",
+    "Reset fit", and the status label. The dialog's widgets are still
+    plain instance attributes (self._n_exp_combo, self._chk_irf_
+    convolution, self._guess_widgets) read the same way as before this
+    change — only their parent widget moved, not how/when they're read.
+
     Optional IRF (Instrument Response Function) overlay: load a second TRPL
     histogram from its own HDF5 file, plotted on the same axes alongside
     Counts. Entirely independent of the Counts/fit workflow above — never
@@ -259,12 +304,36 @@ class TRPLTab(QWidget):
 
         # ── State ────────────────────────────────────────────────
         self._path  = None
-        self._times = None   # ns
+        self._times_raw = None   # ns, exactly as loaded — never modified
+        self._times = None   # working — raw plus the current data time offset
         self._counts_raw = None   # ns-indexed raw Counts, as loaded
         self._counts = None        # working Counts — raw, or raw minus baseline
         self._meta  = {}
 
+        # Data time offset (added 2026-09): a constant (ns) added to
+        # _times_raw to shift the whole Counts curve's own time axis —
+        # mirrors the IRF's own time offset below (same "raw immutable
+        # array + a confirmed/pending offset, recomputed into a working
+        # array" convention — see _recompute_data_working_times()). Useful
+        # e.g. to correct a fixed acquisition/trigger delay in the file's
+        # own Times convention (io_utils._parse_trpl_dat's "0, ns/channel,
+        # …", which just means "start of acquisition", not necessarily
+        # "start of the actual decay") without needing an IRF loaded at
+        # all. Deliberately in-memory only, like the IRF's own offset:
+        # never written back into the loaded file's own Times dataset —
+        # only cached here as self._times, which every fit range/baseline
+        # range below is picked against (not _times_raw). Because of that,
+        # the confirmed value is recorded alongside any saved fit as
+        # "DataTimeOffset" so a saved FitRange/SlowRange/MediumRange/
+        # baseline range can be related back to the file's own raw Times
+        # dataset later (see _on_save()) — and the Visualizer tab's TRPL
+        # overlay, which only ever reads a file's raw Times, reverses this
+        # same offset before drawing the saved fit against it.
+        self._data_time_offset   = 0.0    # confirmed offset (ns)
+        self._data_offset_pending = None  # live value while adjusting, else None
+
         self._mode = "idle"   # "idle" | "selecting" | "baseline_selecting"
+                               # | "data_offset_selecting"
                                # | "irf_baseline_selecting" | "irf_offset_selecting"
                                # | "irf_crop_selecting"
         self._n_exp     = 0      # 1, 2, or 3 exponential components
@@ -280,6 +349,14 @@ class TRPLTab(QWidget):
         self._fit_range  = None   # (xmin, xmax) — the final stage's (fastest component's) fit range
         self._fit_params = None   # (n_exp, 2) ndarray: [a_i, b_i], ordered fastest (row 0) to slowest
         self._fit_cov    = None   # (2, 2) — covariance from the LAST stage's own free-component fit only
+
+        # Per-stage initial-guess (p0) overrides, read once from the
+        # Settings dialog's checkboxes/spinboxes at _on_start_selecting() —
+        # {"slow"|"medium"|"fast": (a0, b0)}, only for slots whose checkbox
+        # was checked. Empty means every stage uses its usual automatic
+        # heuristic (_multiexp_initial_guess/_free_component_initial_guess).
+        # See _guess_slot_for_stage() and _fit_stage()'s use of this.
+        self._fit_initial_guesses = {}
 
         # Populated only once the whole multi-stage attempt is finally
         # confirmed (see _finalize_fit()): every non-final ("fixing")
@@ -391,7 +468,61 @@ class TRPLTab(QWidget):
         gfl.addWidget(btn_load)
         sl.addWidget(g_file)
 
-        # IRF (Instrument Response Function) group
+        # Data time offset group (added 2026-09) — same drag-free,
+        # arrow-button-nudge UX as "IRF Time Offset" below, but shifts the
+        # main Counts curve's own time axis instead of the IRF's. Placed
+        # ahead of baseline/fit so it's the first adjustment made to a
+        # newly-loaded file, since everything after it (baseline ranges,
+        # fit ranges, and — if an IRF is also loaded — its own offset
+        # alignment) is picked against the resulting shifted self._times.
+        g_data_offset = QGroupBox("Data time offset")
+        dol = QVBoxLayout(g_data_offset)
+        self._btn_data_offset = QPushButton("Data Time Offset")
+        self._btn_data_offset.setEnabled(False)
+        self._btn_data_offset.clicked.connect(self._on_start_data_offset)
+        dol.addWidget(self._btn_data_offset)
+
+        data_step_row = QHBoxLayout()
+        data_step_row.addWidget(QLabel("Step:"))
+        self._data_offset_step_spin = QDoubleSpinBox()
+        self._data_offset_step_spin.setDecimals(4)
+        self._data_offset_step_spin.setRange(0.0001, 1000.0)
+        self._data_offset_step_spin.setSingleStep(0.01)
+        self._data_offset_step_spin.setValue(0.1)
+        self._data_offset_step_spin.setSuffix(" ns")
+        data_step_row.addWidget(self._data_offset_step_spin)
+        dol.addLayout(data_step_row)
+
+        data_arrow_row = QHBoxLayout()
+        self._btn_data_offset_dec = QPushButton("◀")
+        self._btn_data_offset_dec.setToolTip("Shift the data earlier by the step size")
+        self._btn_data_offset_dec.setEnabled(False)
+        self._btn_data_offset_dec.clicked.connect(lambda: self._on_data_offset_step(-1))
+        data_arrow_row.addWidget(self._btn_data_offset_dec)
+        self._btn_data_offset_inc = QPushButton("▶")
+        self._btn_data_offset_inc.setToolTip("Shift the data later by the step size")
+        self._btn_data_offset_inc.setEnabled(False)
+        self._btn_data_offset_inc.clicked.connect(lambda: self._on_data_offset_step(+1))
+        data_arrow_row.addWidget(self._btn_data_offset_inc)
+        dol.addLayout(data_arrow_row)
+
+        self._btn_data_offset_reset = QPushButton("Reset data offset")
+        self._btn_data_offset_reset.setEnabled(False)
+        self._btn_data_offset_reset.clicked.connect(self._on_reset_data_offset)
+        dol.addWidget(self._btn_data_offset_reset)
+
+        self._data_offset_status_lbl = QLabel("No data time offset applied.")
+        self._data_offset_status_lbl.setWordWrap(True)
+        dol.addWidget(self._data_offset_status_lbl)
+        g_data_offset.setStyleSheet(_COMPACT_BTN_STYLE)
+        sl.addWidget(g_data_offset)
+
+        # IRF (Instrument Response Function) group — deliberately minimal
+        # (added 2026-09, same convention as the Lifetime fit group below):
+        # every widget for IRF baseline subtraction, time offset, and crop
+        # lives in the separate "TRPL IRF Settings" dialog (see
+        # _build_irf_settings_dialog()), opened via "Settings…" below — only
+        # loading the IRF and toggling its visibility stay in the sidebar.
         g_irf = QGroupBox("IRF (Instrument Response Function)")
         irfl = QVBoxLayout(g_irf)
         self._irf_file_lbl = QLabel("No IRF loaded")
@@ -407,79 +538,11 @@ class TRPLTab(QWidget):
         self._btn_irf_hide.clicked.connect(self._on_toggle_irf_visibility)
         irfl.addWidget(self._btn_irf_hide)
 
-        self._btn_irf_baseline_select = QPushButton("Select IRF baseline range…")
-        self._btn_irf_baseline_select.setEnabled(False)
-        self._btn_irf_baseline_select.clicked.connect(self._on_start_irf_baseline_selecting)
-        irfl.addWidget(self._btn_irf_baseline_select)
+        self._irf_settings_dialog = self._build_irf_settings_dialog()
+        btn_irf_settings = QPushButton("Settings…")
+        btn_irf_settings.clicked.connect(self._on_open_irf_settings)
+        irfl.addWidget(btn_irf_settings)
 
-        self._btn_irf_baseline_reset = QPushButton("Reset IRF baseline")
-        self._btn_irf_baseline_reset.setEnabled(False)
-        self._btn_irf_baseline_reset.clicked.connect(self._on_reset_irf_baseline)
-        irfl.addWidget(self._btn_irf_baseline_reset)
-
-        self._irf_baseline_status_lbl = QLabel("No IRF baseline applied.")
-        self._irf_baseline_status_lbl.setWordWrap(True)
-        irfl.addWidget(self._irf_baseline_status_lbl)
-
-        self._btn_irf_offset = QPushButton("IRF Time Offset")
-        self._btn_irf_offset.setEnabled(False)
-        self._btn_irf_offset.clicked.connect(self._on_start_irf_offset)
-        irfl.addWidget(self._btn_irf_offset)
-
-        # Step size applied per arrow-button click below — a plain user
-        # preference, not itself part of the offset state, so it's left
-        # alone (not reset) whenever a new IRF is loaded or the offset is
-        # reset. 4 decimals gives sub-picosecond control if ever needed.
-        step_row = QHBoxLayout()
-        step_row.addWidget(QLabel("Step:"))
-        self._irf_offset_step_spin = QDoubleSpinBox()
-        self._irf_offset_step_spin.setDecimals(4)
-        self._irf_offset_step_spin.setRange(0.0001, 1000.0)
-        self._irf_offset_step_spin.setSingleStep(0.01)
-        self._irf_offset_step_spin.setValue(0.1)
-        self._irf_offset_step_spin.setSuffix(" ns")
-        step_row.addWidget(self._irf_offset_step_spin)
-        irfl.addLayout(step_row)
-
-        # Arrow buttons nudge the pending offset by +/- the step size above
-        # and redraw immediately — enabled only while a "IRF Time Offset"
-        # attempt is in progress (_on_start_irf_offset/_on_irf_offset_confirm
-        # /_cancel), same lifecycle the slider they replaced had.
-        arrow_row = QHBoxLayout()
-        self._btn_irf_offset_dec = QPushButton("◀")
-        self._btn_irf_offset_dec.setToolTip("Shift the IRF earlier by the step size")
-        self._btn_irf_offset_dec.setEnabled(False)
-        self._btn_irf_offset_dec.clicked.connect(lambda: self._on_irf_offset_step(-1))
-        arrow_row.addWidget(self._btn_irf_offset_dec)
-        self._btn_irf_offset_inc = QPushButton("▶")
-        self._btn_irf_offset_inc.setToolTip("Shift the IRF later by the step size")
-        self._btn_irf_offset_inc.setEnabled(False)
-        self._btn_irf_offset_inc.clicked.connect(lambda: self._on_irf_offset_step(+1))
-        arrow_row.addWidget(self._btn_irf_offset_inc)
-        irfl.addLayout(arrow_row)
-
-        self._btn_irf_offset_reset = QPushButton("Reset IRF offset")
-        self._btn_irf_offset_reset.setEnabled(False)
-        self._btn_irf_offset_reset.clicked.connect(self._on_reset_irf_offset)
-        irfl.addWidget(self._btn_irf_offset_reset)
-
-        self._irf_offset_status_lbl = QLabel("No IRF time offset applied.")
-        self._irf_offset_status_lbl.setWordWrap(True)
-        irfl.addWidget(self._irf_offset_status_lbl)
-
-        self._btn_irf_crop = QPushButton("Crop IRF")
-        self._btn_irf_crop.setEnabled(False)
-        self._btn_irf_crop.clicked.connect(self._on_start_irf_crop)
-        irfl.addWidget(self._btn_irf_crop)
-
-        self._btn_irf_crop_reset = QPushButton("Reset IRF crop")
-        self._btn_irf_crop_reset.setEnabled(False)
-        self._btn_irf_crop_reset.clicked.connect(self._on_reset_irf_crop)
-        irfl.addWidget(self._btn_irf_crop_reset)
-
-        self._irf_crop_status_lbl = QLabel("No IRF crop applied.")
-        self._irf_crop_status_lbl.setWordWrap(True)
-        irfl.addWidget(self._irf_crop_status_lbl)
         g_irf.setStyleSheet(_COMPACT_BTN_STYLE)
         sl.addWidget(g_irf)
 
@@ -502,25 +565,21 @@ class TRPLTab(QWidget):
         g_base.setStyleSheet(_COMPACT_BTN_STYLE)
         sl.addWidget(g_base)
 
-        # Fit group
+        # Fit group — deliberately minimal (added 2026-09): every widget
+        # that configures *how* a fit runs (exponential count, IRF
+        # convolution, initial-guess overrides) lives in the separate
+        # "TRPL Fit Settings" dialog (see _build_fit_settings_dialog()),
+        # opened via "Settings…" below — only the two actions that drive
+        # the fit-range-selection workflow itself, plus its status readout,
+        # stay in the sidebar.
         g_fit = QGroupBox("Lifetime fit  (Σ aᵢ·exp(−bᵢ·t))")
         fitl = QVBoxLayout(g_fit)
-        r_n = QHBoxLayout()
-        r_n.addWidget(QLabel("Exponentials:"))
-        self._n_exp_combo = QComboBox()
-        self._n_exp_combo.addItem("1 — single exponential", 1)
-        self._n_exp_combo.addItem("2 — double (fast + slow)", 2)
-        self._n_exp_combo.addItem("3 — triple (fast + medium + slow)", 3)
-        r_n.addWidget(self._n_exp_combo)
-        fitl.addLayout(r_n)
 
-        self._chk_irf_convolution = QCheckBox("Include IRF convolution")
-        self._chk_irf_convolution.setEnabled(False)
-        self._chk_irf_convolution.setToolTip(
-            "Fit Counts(t) = IRF(t) ⊛ Σᵢ aᵢ·exp(−bᵢ·t) "
-            "instead of the bare sum — requires an IRF to be loaded."
-        )
-        fitl.addWidget(self._chk_irf_convolution)
+        self._fit_settings_dialog = self._build_fit_settings_dialog()
+
+        btn_fit_settings = QPushButton("Settings…")
+        btn_fit_settings.clicked.connect(self._on_open_fit_settings)
+        fitl.addWidget(btn_fit_settings)
 
         self._btn_start = QPushButton("Select fit range…")
         self._btn_start.setEnabled(False)
@@ -586,6 +645,212 @@ class TRPLTab(QWidget):
 
         layout.addWidget(right, stretch=1)
 
+    # ── Fit settings dialog ─────────────────────────────────────
+    # Added 2026-09: every widget that configures how the next fit attempt
+    # runs — Exponentials count, "Include IRF convolution", and the
+    # per-stage initial-guess overrides — lives here rather than inline in
+    # the sidebar. The dialog is built once (lazily reused, not
+    # recreated) and shown non-modally so it can stay open alongside the
+    # plot while the user adjusts settings and clicks "Select fit range…".
+
+    def _build_fit_settings_dialog(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("TRPL Fit Settings")
+        dlg.setModal(False)
+        dlg.setStyleSheet(_COMPACT_BTN_STYLE)
+        vlay = QVBoxLayout(dlg)
+
+        g_cfg = QGroupBox("Fit configuration")
+        cfgl = QVBoxLayout(g_cfg)
+        r_n = QHBoxLayout()
+        r_n.addWidget(QLabel("Exponentials:"))
+        self._n_exp_combo = QComboBox()
+        self._n_exp_combo.addItem("1 — single exponential", 1)
+        self._n_exp_combo.addItem("2 — double (fast + slow)", 2)
+        self._n_exp_combo.addItem("3 — triple (fast + medium + slow)", 3)
+        r_n.addWidget(self._n_exp_combo)
+        cfgl.addLayout(r_n)
+
+        self._chk_irf_convolution = QCheckBox("Include IRF convolution")
+        self._chk_irf_convolution.setEnabled(False)
+        self._chk_irf_convolution.setToolTip(
+            "Fit Counts(t) = IRF(t) ⊛ Σᵢ aᵢ·exp(−bᵢ·t) "
+            "instead of the bare sum — requires an IRF to be loaded."
+        )
+        cfgl.addWidget(self._chk_irf_convolution)
+        vlay.addWidget(g_cfg)
+
+        # Per-stage initial-guess (p0) overrides — 3 fixed slots regardless
+        # of the current Exponentials selection (see _guess_slot_for_stage()
+        # for why the mapping from stage index to slot is n_exp-independent
+        # and so a typed guess survives switching the combo). Each slot
+        # starts unchecked/disabled: the stage falls back to its automatic
+        # heuristic (_multiexp_initial_guess/_free_component_initial_guess)
+        # unless the user explicitly opts in.
+        g_guess = QGroupBox("Initial guesses (optional)")
+        g_guess.setToolTip(
+            "Override the automatic p0 seed scipy.optimize.curve_fit starts "
+            "from for a stage's free component. Leave unchecked to use the "
+            "automatic guess. Read once when \"Select fit range…\" starts a "
+            "new attempt — changes here don't affect a fit already in "
+            "progress."
+        )
+        guess_grid = QGridLayout(g_guess)
+        guess_grid.addWidget(QLabel("Component"), 0, 0)
+        guess_grid.addWidget(QLabel("a₀ (counts)"), 0, 1, 1, 2)
+        guess_grid.addWidget(QLabel("b₀ (1/ns)"), 0, 3, 1, 2)
+
+        self._guess_widgets = {}
+        rows = [
+            ("slow",   "Slow (1st stage, N≥2)"),
+            ("medium", "Medium (2nd stage, N=3)"),
+            ("fast",   "Fast (final stage)"),
+        ]
+        for row, (slot, label) in enumerate(rows, start=1):
+            chk = QCheckBox(label)
+            a_spin = QDoubleSpinBox()
+            a_spin.setDecimals(3)
+            a_spin.setRange(0.0, 1.0e12)
+            a_spin.setSingleStep(10.0)
+            a_spin.setValue(1.0)
+            a_spin.setEnabled(False)
+            b_spin = QDoubleSpinBox()
+            b_spin.setDecimals(6)
+            b_spin.setRange(0.0, 1.0e6)
+            b_spin.setSingleStep(0.01)
+            b_spin.setValue(1.0)
+            b_spin.setEnabled(False)
+            # Bind a=a_spin, b=b_spin at connect-time so each checkbox only
+            # ever toggles its own row's spinboxes.
+            chk.toggled.connect(lambda checked, a=a_spin, b=b_spin: (
+                a.setEnabled(checked), b.setEnabled(checked)))
+
+            guess_grid.addWidget(chk, row, 0)
+            guess_grid.addWidget(a_spin, row, 1, 1, 2)
+            guess_grid.addWidget(b_spin, row, 3, 1, 2)
+            self._guess_widgets[slot] = (chk, a_spin, b_spin)
+        vlay.addWidget(g_guess)
+
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(dlg.close)
+        vlay.addWidget(btn_close)
+        return dlg
+
+    def _on_open_fit_settings(self):
+        self._fit_settings_dialog.show()
+        self._fit_settings_dialog.raise_()
+        self._fit_settings_dialog.activateWindow()
+
+    # ── IRF settings dialog ──────────────────────────────────────
+    # Added 2026-09, same convention as the fit-settings dialog above:
+    # every IRF baseline-subtraction/time-offset/crop widget lives in this
+    # separate non-modal dialog (built once, reused) rather than inline in
+    # the sidebar — only "Load IRF…" and "Hide IRF"/"Show IRF" (which need
+    # to stay reachable without opening anything) remain there. Being
+    # non-modal, it can stay open alongside the plot while a
+    # baseline/offset/crop selection is dragged on the canvas and confirmed
+    # via the shared action bar, exactly as before this change.
+
+    def _build_irf_settings_dialog(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("TRPL IRF Settings")
+        dlg.setModal(False)
+        dlg.setStyleSheet(_COMPACT_BTN_STYLE)
+        vlay = QVBoxLayout(dlg)
+
+        g_base = QGroupBox("IRF baseline subtraction")
+        basel = QVBoxLayout(g_base)
+        self._btn_irf_baseline_select = QPushButton("Select IRF baseline range…")
+        self._btn_irf_baseline_select.setEnabled(False)
+        self._btn_irf_baseline_select.clicked.connect(self._on_start_irf_baseline_selecting)
+        basel.addWidget(self._btn_irf_baseline_select)
+
+        self._btn_irf_baseline_reset = QPushButton("Reset IRF baseline")
+        self._btn_irf_baseline_reset.setEnabled(False)
+        self._btn_irf_baseline_reset.clicked.connect(self._on_reset_irf_baseline)
+        basel.addWidget(self._btn_irf_baseline_reset)
+
+        self._irf_baseline_status_lbl = QLabel("No IRF baseline applied.")
+        self._irf_baseline_status_lbl.setWordWrap(True)
+        basel.addWidget(self._irf_baseline_status_lbl)
+        vlay.addWidget(g_base)
+
+        g_offset = QGroupBox("IRF time offset")
+        offl = QVBoxLayout(g_offset)
+        self._btn_irf_offset = QPushButton("IRF Time Offset")
+        self._btn_irf_offset.setEnabled(False)
+        self._btn_irf_offset.clicked.connect(self._on_start_irf_offset)
+        offl.addWidget(self._btn_irf_offset)
+
+        # Step size applied per arrow-button click below — a plain user
+        # preference, not itself part of the offset state, so it's left
+        # alone (not reset) whenever a new IRF is loaded or the offset is
+        # reset. 4 decimals gives sub-picosecond control if ever needed.
+        step_row = QHBoxLayout()
+        step_row.addWidget(QLabel("Step:"))
+        self._irf_offset_step_spin = QDoubleSpinBox()
+        self._irf_offset_step_spin.setDecimals(4)
+        self._irf_offset_step_spin.setRange(0.0001, 1000.0)
+        self._irf_offset_step_spin.setSingleStep(0.01)
+        self._irf_offset_step_spin.setValue(0.1)
+        self._irf_offset_step_spin.setSuffix(" ns")
+        step_row.addWidget(self._irf_offset_step_spin)
+        offl.addLayout(step_row)
+
+        # Arrow buttons nudge the pending offset by +/- the step size above
+        # and redraw immediately — enabled only while a "IRF Time Offset"
+        # attempt is in progress (_on_start_irf_offset/_on_irf_offset_confirm
+        # /_cancel), same lifecycle the slider they replaced had.
+        arrow_row = QHBoxLayout()
+        self._btn_irf_offset_dec = QPushButton("◀")
+        self._btn_irf_offset_dec.setToolTip("Shift the IRF earlier by the step size")
+        self._btn_irf_offset_dec.setEnabled(False)
+        self._btn_irf_offset_dec.clicked.connect(lambda: self._on_irf_offset_step(-1))
+        arrow_row.addWidget(self._btn_irf_offset_dec)
+        self._btn_irf_offset_inc = QPushButton("▶")
+        self._btn_irf_offset_inc.setToolTip("Shift the IRF later by the step size")
+        self._btn_irf_offset_inc.setEnabled(False)
+        self._btn_irf_offset_inc.clicked.connect(lambda: self._on_irf_offset_step(+1))
+        arrow_row.addWidget(self._btn_irf_offset_inc)
+        offl.addLayout(arrow_row)
+
+        self._btn_irf_offset_reset = QPushButton("Reset IRF offset")
+        self._btn_irf_offset_reset.setEnabled(False)
+        self._btn_irf_offset_reset.clicked.connect(self._on_reset_irf_offset)
+        offl.addWidget(self._btn_irf_offset_reset)
+
+        self._irf_offset_status_lbl = QLabel("No IRF time offset applied.")
+        self._irf_offset_status_lbl.setWordWrap(True)
+        offl.addWidget(self._irf_offset_status_lbl)
+        vlay.addWidget(g_offset)
+
+        g_crop = QGroupBox("IRF crop")
+        cropl = QVBoxLayout(g_crop)
+        self._btn_irf_crop = QPushButton("Crop IRF")
+        self._btn_irf_crop.setEnabled(False)
+        self._btn_irf_crop.clicked.connect(self._on_start_irf_crop)
+        cropl.addWidget(self._btn_irf_crop)
+
+        self._btn_irf_crop_reset = QPushButton("Reset IRF crop")
+        self._btn_irf_crop_reset.setEnabled(False)
+        self._btn_irf_crop_reset.clicked.connect(self._on_reset_irf_crop)
+        cropl.addWidget(self._btn_irf_crop_reset)
+
+        self._irf_crop_status_lbl = QLabel("No IRF crop applied.")
+        self._irf_crop_status_lbl.setWordWrap(True)
+        cropl.addWidget(self._irf_crop_status_lbl)
+        vlay.addWidget(g_crop)
+
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(dlg.close)
+        vlay.addWidget(btn_close)
+        return dlg
+
+    def _on_open_irf_settings(self):
+        self._irf_settings_dialog.show()
+        self._irf_settings_dialog.raise_()
+        self._irf_settings_dialog.activateWindow()
+
     # ── Action bar dispatch ──────────────────────────────────────
     # The action bar (Confirm/Cancel) is shared between the lifetime-fit
     # range selector (itself possibly several stages, for N >= 2) and the
@@ -597,6 +862,8 @@ class TRPLTab(QWidget):
             self._on_confirm_fit()
         elif self._mode == "baseline_selecting":
             self._on_baseline_confirm()
+        elif self._mode == "data_offset_selecting":
+            self._on_data_offset_confirm()
         elif self._mode == "irf_baseline_selecting":
             self._on_irf_baseline_confirm()
         elif self._mode == "irf_offset_selecting":
@@ -609,6 +876,8 @@ class TRPLTab(QWidget):
             self._on_reset_fits()
         elif self._mode == "baseline_selecting":
             self._on_baseline_cancel()
+        elif self._mode == "data_offset_selecting":
+            self._on_data_offset_cancel()
         elif self._mode == "irf_baseline_selecting":
             self._on_irf_baseline_cancel()
         elif self._mode == "irf_offset_selecting":
@@ -632,7 +901,10 @@ class TRPLTab(QWidget):
             return
 
         self._path   = path
-        self._times  = data["times"]
+        self._times_raw = np.asarray(data["times"], dtype=float)
+        self._data_time_offset = 0.0
+        self._data_offset_pending = None
+        self._recompute_data_working_times()
         self._counts_raw = np.asarray(data["counts"], dtype=float)
         self._counts = self._counts_raw.copy()
         self._meta   = data
@@ -651,6 +923,8 @@ class TRPLTab(QWidget):
         self._fit_status_lbl.setText("")
         self._btn_baseline_reset.setEnabled(False)
         self._baseline_status_lbl.setText("No baseline applied.")
+        self._btn_data_offset_reset.setEnabled(False)
+        self._data_offset_status_lbl.setText("No data time offset applied.")
         self._set_exclusive_buttons_enabled(True)
         self._draw_base_plot()
 
@@ -659,6 +933,135 @@ class TRPLTab(QWidget):
             parent.statusBar().showMessage(
                 f"TRPL: loaded {label} ({len(self._times)} channels)."
             )
+
+    # ── Data time offset ────────────────────────────────────────────
+    # Added 2026-09, mirroring the IRF's own "IRF Time Offset" below:
+    # shifts the main Counts curve's own time axis by a constant (ns),
+    # nudged by two arrow buttons (+/- a user-set step size) rather than a
+    # DraggableSpan, since there's a single value to pick rather than a
+    # range. Every fit range and baseline range is picked against
+    # self._times (the working, offset-applied array) elsewhere in this
+    # tab, so applying or resetting this offset invalidates any already-
+    # confirmed lifetime fit (_invalidate_lifetime_fits()) — its saved
+    # range would otherwise silently select the wrong samples once
+    # self._times shifts under it. The confirmed baseline is left alone:
+    # its value is just a constant already subtracted from self._counts,
+    # not tied to any particular time axis, so a later data-offset change
+    # can't invalidate it the way it can a range-dependent fit.
+
+    def _recompute_data_working_times(self, offset=None):
+        """Rebuild self._times from the immutable self._times_raw plus the
+        confirmed (or, if given, a live pending) data time offset — same
+        convention as _recompute_irf_working_arrays(). self._counts/
+        self._counts_raw are untouched: adding a constant to every time
+        LABEL doesn't change which count value belongs to which sample."""
+        if self._times_raw is None:
+            return
+        eff_offset = self._data_time_offset if offset is None else offset
+        self._times = self._times_raw + eff_offset
+
+    def _on_start_data_offset(self):
+        if self._times_raw is None or self._mode != "idle":
+            return
+
+        self._mode = "data_offset_selecting"
+        self._set_exclusive_buttons_enabled(False)
+
+        self._data_offset_pending = self._data_time_offset
+        self._btn_data_offset_dec.setEnabled(True)
+        self._btn_data_offset_inc.setEnabled(True)
+        self._data_offset_step_spin.setEnabled(True)
+        self._data_offset_status_lbl.setText(f"Offset: {self._data_time_offset:+.4g} ns")
+
+        self._btn_act_confirm.setEnabled(True)   # any value is valid, unlike a range pick
+        self._btn_act_confirm.setText("Confirm data offset")
+        self._action_bar.setVisible(True)
+
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "statusBar"):
+            parent.statusBar().showMessage(
+                "TRPL: use the ◀/▶ buttons to shift the data's time axis, "
+                "then Confirm."
+            )
+
+    def _on_data_offset_step(self, direction):
+        if self._mode != "data_offset_selecting":
+            return
+        offset = self._data_offset_pending + direction * self._data_offset_step_spin.value()
+        self._data_offset_pending = offset
+        self._recompute_data_working_times(offset=offset)
+        self._data_offset_status_lbl.setText(f"Offset: {offset:+.4g} ns")
+        self._action_lbl.setText(f"Data time offset: {offset:+.4g} ns")
+        self._redraw_preserving_view()
+
+    def _on_data_offset_confirm(self):
+        if self._mode != "data_offset_selecting":
+            return
+        self._data_time_offset = self._data_offset_pending
+        self._data_offset_pending = None
+        # Recompute from _times_raw rather than trusting the
+        # click-accumulated working array verbatim, so the confirmed value
+        # is exactly _times_raw + _data_time_offset with no accumulated
+        # float drift from repeated clicks.
+        self._recompute_data_working_times()
+
+        # Any already-confirmed lifetime fit was picked against the old
+        # self._times — its saved range would now select different
+        # samples than the user actually chose, so it can't be trusted.
+        self._invalidate_lifetime_fits()
+
+        self._btn_data_offset_dec.setEnabled(False)
+        self._btn_data_offset_inc.setEnabled(False)
+        self._data_offset_step_spin.setEnabled(False)
+        self._mode = "idle"
+        self._action_bar.setVisible(False)
+        self._btn_act_confirm.setText("Confirm fit")
+        self._set_exclusive_buttons_enabled(True)
+        self._btn_data_offset_reset.setEnabled(self._data_time_offset != 0.0)
+        self._data_offset_status_lbl.setText(
+            f"Data time offset: {self._data_time_offset:+.4g} ns"
+        )
+        self._draw_base_plot()
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "statusBar"):
+            parent.statusBar().showMessage(
+                f"TRPL: data time offset {self._data_time_offset:+.4g} ns confirmed."
+            )
+
+    def _on_data_offset_cancel(self):
+        self._data_offset_pending = None
+        # Revert the working array back to the last confirmed offset — it
+        # may have been live-shifted by arrow-button clicks since.
+        self._recompute_data_working_times()
+
+        self._btn_data_offset_dec.setEnabled(False)
+        self._btn_data_offset_inc.setEnabled(False)
+        self._data_offset_step_spin.setEnabled(False)
+        self._mode = "idle"
+        self._action_bar.setVisible(False)
+        self._btn_act_confirm.setText("Confirm fit")
+        self._set_exclusive_buttons_enabled(True)
+        self._data_offset_status_lbl.setText(
+            f"Data time offset: {self._data_time_offset:+.4g} ns"
+            if self._data_time_offset != 0.0 else "No data time offset applied."
+        )
+        self._draw_base_plot()
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "statusBar"):
+            parent.statusBar().showMessage("TRPL: data time offset selection canceled.")
+
+    def _on_reset_data_offset(self):
+        if self._data_time_offset == 0.0:
+            return
+        self._data_time_offset = 0.0
+        self._recompute_data_working_times()
+        self._invalidate_lifetime_fits()
+        self._btn_data_offset_reset.setEnabled(False)
+        self._data_offset_status_lbl.setText("No data time offset applied.")
+        self._draw_base_plot()
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "statusBar"):
+            parent.statusBar().showMessage("TRPL: data time offset reset.")
 
     # ── IRF (Instrument Response Function) ──────────────────────────
     # An optional second TRPL histogram loaded from its own file and
@@ -747,18 +1150,20 @@ class TRPLTab(QWidget):
         vb.setRange(xRange=prev_range[0], yRange=prev_range[1], padding=0)
 
     def _set_exclusive_buttons_enabled(self, enabled):
-        """Enable/disable every button that starts one of the five
+        """Enable/disable every button that starts one of the six
         mutually-exclusive interactive modes (lifetime-fit range, Counts
-        baseline, IRF baseline, IRF time offset, IRF crop) plus the IRF
-        visibility toggle — all of them either add a DraggableSpan (or, for
-        the IRF offset arrow buttons, an equivalent live-adjust control)
-        wired to the single shared action bar, or (Hide/Show IRF) would
-        corrupt an in-progress control's state via _draw_base_plot()'s
-        full-clear rebuild. Call with False when entering any of the five
-        modes; call with True when returning to idle, which re-enables
-        each button only if its own prerequisite data is actually loaded."""
+        baseline, data time offset, IRF baseline, IRF time offset, IRF
+        crop) plus the IRF visibility toggle — all of them either add a
+        DraggableSpan (or, for the data/IRF offset arrow buttons, an
+        equivalent live-adjust control) wired to the single shared action
+        bar, or (Hide/Show IRF) would corrupt an in-progress control's
+        state via _draw_base_plot()'s full-clear rebuild. Call with False
+        when entering any of the six modes; call with True when returning
+        to idle, which re-enables each button only if its own prerequisite
+        data is actually loaded."""
         self._btn_start.setEnabled(enabled and self._times is not None)
         self._btn_baseline_select.setEnabled(enabled and self._times is not None)
+        self._btn_data_offset.setEnabled(enabled and self._times is not None)
         self._btn_irf_baseline_select.setEnabled(enabled and self._irf_times is not None)
         self._btn_irf_hide.setEnabled(enabled and self._irf_times is not None)
         self._btn_irf_offset.setEnabled(enabled and self._irf_times is not None)
@@ -1422,6 +1827,11 @@ class TRPLTab(QWidget):
 
         self._n_exp      = self._n_exp_combo.currentData()
         self._fit_use_irf_convolution = self._chk_irf_convolution.isChecked()
+        self._fit_initial_guesses = {
+            slot: (float(a_spin.value()), float(b_spin.value()))
+            for slot, (chk, a_spin, b_spin) in self._guess_widgets.items()
+            if chk.isChecked()
+        }
         self._fit_range  = None
         self._fit_params = None
         self._fit_cov    = None
@@ -1597,6 +2007,14 @@ class TRPLTab(QWidget):
             for af, bf in fixed_params:
                 y_resid = y_resid - af * np.exp(-bf * x)
             p0 = _free_component_initial_guess(x, y_resid, fixed_params)
+
+        # User-supplied (a0, b0) override for this stage's slot (see
+        # _guess_slot_for_stage()/the Settings dialog), read once at
+        # _on_start_selecting() — takes the place of the automatic
+        # heuristic above entirely rather than blending with it.
+        override = self._fit_initial_guesses.get(_guess_slot_for_stage(j, self._n_exp))
+        if override is not None:
+            p0 = np.array(override, dtype=float)
 
         if self._fit_use_irf_convolution:
             irf_norm = self._irf_normalized()
@@ -1917,8 +2335,10 @@ class TRPLTab(QWidget):
 
     def _invalidate_lifetime_fits(self):
         """Discard any confirmed lifetime fit — call whenever the working
-        Counts change (baseline applied or reset) so a stale fit computed on
-        different data can't be saved or displayed as current."""
+        Counts change (baseline applied or reset) or the working time axis
+        shifts (data time offset applied or reset) so a stale fit computed
+        against different data/axis can't be saved or displayed as
+        current."""
         self._reset_fit_state()
         self._btn_reset_fits.setEnabled(False)
         self._btn_save.setEnabled(False)
@@ -2046,6 +2466,21 @@ class TRPLTab(QWidget):
                 grp.attrs["FitFunction"] = fit_function_desc
                 grp.attrs["IRFConvolutionApplied"] = bool(self._fit_use_irf_convolution)
 
+                # Every range/x-value below (FitRange, SlowRange,
+                # MediumRange, Baseline's own FitRange attribute) was
+                # picked against self._times = this file's own raw Times
+                # dataset + this offset (see "Data time offset" in the
+                # sidebar / _recompute_data_working_times()) — 0.0 if it
+                # was never applied. Saved unconditionally (like
+                # IRFConvolutionApplied above) so any of those saved
+                # ranges can always be related back to the file's own
+                # unmodified Times: raw_Times = Times_in_saved_ranges -
+                # DataTimeOffset. The Visualizer tab's TRPL overlay, which
+                # only ever reads the file's raw Times, reverses this
+                # offset before drawing the saved fit against it.
+                grp.attrs["DataTimeOffset"] = float(self._data_time_offset)
+                grp.attrs["DataTimeOffset_units"] = "ns"
+
                 ds_p = grp.create_dataset("FitParameters", data=params_arr)
                 ds_p.attrs["description"] = params_desc
 
@@ -2112,6 +2547,8 @@ class TRPLTab(QWidget):
         )
         if self._baseline_value is not None:
             msg += "\n(including Baseline and CountsBased)"
+        if self._data_time_offset != 0.0:
+            msg += f"\n(fit ranges use a {self._data_time_offset:+.4g} ns data time offset — see DataTimeOffset)"
         QMessageBox.information(self, "Saved", msg)
         parent = self.parent()
         if parent is not None and hasattr(parent, "statusBar"):

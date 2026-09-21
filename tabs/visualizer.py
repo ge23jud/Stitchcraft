@@ -973,6 +973,7 @@ class VisualizerTab(QWidget):
             return None
 
         fit_params = fit_range = lifetimes = total_decay_time = None
+        data_time_offset = 0.0
         try:
             with h5py.File(path, "r") as f:
                 if "analysis" in f:
@@ -994,6 +995,17 @@ class VisualizerTab(QWidget):
                     # from the label text below.
                     if "Total_Decay_Time" in agrp:
                         total_decay_time = float(agrp["Total_Decay_Time"][()])
+                    # Added alongside trpl.py's "Data time offset" (2026-09):
+                    # FitRange (and FitParameters, via the model evaluated
+                    # below) was fit against the TRPL tab's own working
+                    # Times = this file's raw Times + DataTimeOffset, not
+                    # the raw Times this method just read via
+                    # _read_trpl_h5_file() into data["times"] above — absent
+                    # in older files (or a file where it was never applied),
+                    # in which case it's just 0.0 and every use below is a
+                    # no-op, exactly reproducing the pre-2026-09 behavior.
+                    if "DataTimeOffset" in agrp.attrs:
+                        data_time_offset = float(agrp.attrs["DataTimeOffset"])
         except Exception:
             pass   # fit overlay/lifetime text are optional extras
 
@@ -1006,6 +1018,7 @@ class VisualizerTab(QWidget):
             "fit_range":        fit_range,
             "lifetimes":        lifetimes,
             "total_decay_time": total_decay_time,
+            "data_time_offset": data_time_offset,
         }
 
     def _vis_trpl_on_remove(self):
@@ -1058,7 +1071,16 @@ class VisualizerTab(QWidget):
                 color = pg.mkColor(TAB10[fi % 10])
                 region_color = pg.mkColor(color)
                 region_color.setAlpha(40)
-                xmin, xmax = (float(v) for v in d["fit_range"])
+                # FitRange is in the TRPL tab's own working-time axis
+                # (raw Times + DataTimeOffset — see trpl.py's "Data time
+                # offset" and its _on_save()), but d["times"]/d["counts"]
+                # above are the file's unmodified raw Times — so the
+                # shaded region has to be shifted back by that same
+                # offset to land on the actual samples it was picked
+                # over. offset defaults to 0.0 for files saved before
+                # this attribute existed, making this a no-op then.
+                offset = d.get("data_time_offset", 0.0)
+                xmin, xmax = (float(v) - offset for v in d["fit_range"])
                 region = pg.LinearRegionItem(
                     values=(xmin, xmax), orientation="vertical",
                     brush=pg.mkBrush(region_color), movable=False,
@@ -1068,9 +1090,12 @@ class VisualizerTab(QWidget):
                 x_curve = np.linspace(xmin, xmax, 200)
                 # Sum of exponentials: one (a, b) row per component, all
                 # sharing this one fit range (see trpl.py's save routine).
+                # Evaluated at x_curve + offset — i.e. back on the
+                # working-time axis FitParameters was actually fit
+                # against — then plotted at x_curve's raw-time position.
                 y_curve = np.zeros_like(x_curve)
                 for a, b in d["fit_params"]:
-                    y_curve = y_curve + a * np.exp(-b * x_curve)
+                    y_curve = y_curve + a * np.exp(-b * (x_curve + offset))
                 ax.plot(x_curve, y_curve, pen=pg.mkPen(color, width=1.5))
 
             if d["lifetimes"] is not None and len(d["lifetimes"]):
