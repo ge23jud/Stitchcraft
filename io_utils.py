@@ -2,6 +2,7 @@ import os
 import re
 import numpy as np
 import h5py
+from datetime import datetime
 
 from pl import _HC_EV_NM
 
@@ -177,8 +178,10 @@ def _write_origin_file(output_path, wl_out, counts_out, header_meta, powers_W):
 def _write_h5_file(output_path, wl_out, counts_diff, counts_raw, header_meta,
                    powers_W, stitched=False, source_datasets=None,
                    dark_by_label=None, spot_diameter_um=None, rep_rate_mhz=None,
-                   power_cal=None, baseline_value=None, baseline_range_nm=None):
-    """Write a power-series spectrum to HDF5, preserving all .origin metadata.
+                   power_cal=None, baseline_value=None, baseline_range_nm=None,
+                   angles_deg=None):
+    """Write a power-series (or polarization-series) spectrum to HDF5,
+    preserving all .origin metadata.
 
     Structure
     ---------
@@ -198,6 +201,8 @@ def _write_h5_file(output_path, wl_out, counts_diff, counts_raw, header_meta,
         wavelength_nm           float64 (n_wl_i,)
         counts                  float64 (n_wl_i, n_powers)  — raw (not dark-subtracted)
         darkspec                float64 (n_wl_i,)            — mean dark (if available)
+    /Angle                      float64 (n_angles,)       — degrees (polarization
+                                                              series only, see below)
     Root attrs: format_version, stitched, date_str, int_time_str,
                 center_nm, center_eV, dispersion_nm, dispersion_eV,
                 spot_diameter_um (optional), rep_rate_mhz (optional),
@@ -214,6 +219,14 @@ def _write_h5_file(output_path, wl_out, counts_diff, counts_raw, header_meta,
     already the subtracted array); baseline_range_nm (lo_nm, hi_nm) — the
     one wavelength range shared by every step's fit — is stored as the
     dataset's own "FitRange" attribute.
+
+    angles_deg (optional): for a polarization series, the (n_angles,)
+    polarization angle of each spectrum column. Written as an "Angle"
+    dataset, the spectra's "axes" attr becomes "Energy : Angle" and a root
+    "measurement" attr is set to "Polarization". powers_W is then a
+    1-element array holding the series' single excitation power, so
+    Power_uncalibrated/Power/Power_density/Pump_fluence are single values
+    (1-element arrays) computed the same way as for a power series.
     """
     # Accept wl_out in nm (> 50) or eV (< 50); always save as eV.
     if float(wl_out.min()) < 50.0:          # already eV
@@ -241,6 +254,7 @@ def _write_h5_file(output_path, wl_out, counts_diff, counts_raw, header_meta,
         hwp_vals   = [v for v in re.split(r"\s+", array_str.strip()) if v]
 
     raw      = header_meta.get("raw_header_lines", [])
+    axes     = "Energy : Angle" if angles_deg is not None else "Energy : Power_uncalibrated"
     has_dark = bool(dark_by_label and any(v is not None for v in dark_by_label.values()))
 
     with h5py.File(output_path, "w") as f:
@@ -250,7 +264,7 @@ def _write_h5_file(output_path, wl_out, counts_diff, counts_raw, header_meta,
 
         d_diff = f.create_dataset("SpectraDiff", data=counts_diff, compression="gzip")
         d_diff.attrs["units"]           = f"Counts/{int_time_str}s"
-        d_diff.attrs["axes"]            = "Energy : Power_uncalibrated"
+        d_diff.attrs["axes"]            = axes
         d_diff.attrs["dark_subtracted"] = "Yes" if has_dark else "No"
         d_diff.attrs["baseline_subtracted"] = "Yes" if baseline_value is not None else "No"
 
@@ -260,10 +274,11 @@ def _write_h5_file(output_path, wl_out, counts_diff, counts_raw, header_meta,
             )
             d_bl.attrs["units"] = f"Counts/{int_time_str}s"
             d_bl.attrs["description"] = (
-                "(n_powers,): one constant per power step, each fit "
+                "(n_cols,): one constant per spectrum column (power step, "
+                "or angle for a polarization series), each fit "
                 "independently (mean counts over a user-picked wavelength "
                 "range, after stitching and dark subtraction) from that "
-                "step's own data and subtracted from just that step's "
+                "column's own data and subtracted from just that "
                 "SpectraDiff column"
             )
             if baseline_range_nm is not None:
@@ -272,10 +287,15 @@ def _write_h5_file(output_path, wl_out, counts_diff, counts_raw, header_meta,
 
         d_raw = f.create_dataset("Spectra_raw", data=counts_raw, compression="gzip")
         d_raw.attrs["units"] = f"Counts/{int_time_str}s"
-        d_raw.attrs["axes"]  = "Energy : Power_uncalibrated"
+        d_raw.attrs["axes"]  = axes
 
         d_p = f.create_dataset("Power_uncalibrated", data=powers_W * 1e3)
         d_p.attrs["units"] = "mW"
+
+        if angles_deg is not None:
+            d_a = f.create_dataset("Angle", data=np.asarray(angles_deg, dtype=float))
+            d_a.attrs["units"] = "degrees"
+            f.attrs["measurement"] = "Polarization"
 
         if hwp_vals:
             try:
@@ -535,6 +555,99 @@ def _write_trpl_h5_file(output_path, counts, ns_per_channel, date_str,
                     / np.pi / dspot_cm ** 2 * 1e3)          # → mJ/cm²
         d_fl = f.create_dataset("Pump_fluence", data=np.array([fluence], dtype=float))
         d_fl.attrs["units"] = "mJ/cm^2"
+
+
+def _parse_pol_origin(filepath):
+    """Parse a polarization-series .origin file.
+
+    Expected layout: tab-separated "label<TAB>value" header lines (Date,
+    Measurement type: Polarization, Integration time, ...), a blank line,
+    then three column-header rows — "Wavelength / Polarization spectrum …",
+    "(nm) / (Counts/…s) …", "Polarization angle (°) / 0 / 5 / …" — followed
+    by one data row per wavelength: wl_nm, counts at each angle.
+
+    Returns dict: wl (nm, ascending, (n_wl,)), counts ((n_wl, n_angles)),
+    angles (degrees, (n_angles,)), hdr — a header dict with the same keys as
+    pl._parse_origin_header (raw_header_lines, date_str, date, int_time_str,
+    hwp_raw — always empty here) so it works with _parse_header_center_disp
+    and as _write_h5_file's header_meta, plus excitation_power_W (float from
+    the "Excitation power" line, or None if absent/unparseable).
+    """
+    with open(filepath, encoding="latin-1", errors="replace") as fh:
+        lines = [l.rstrip("\r\n") for l in fh]
+
+    angle_row = next(
+        (i for i, l in enumerate(lines)
+         if l.lower().startswith("polarization angle")), None
+    )
+    if angle_row is None:
+        raise ValueError(
+            f"No 'Polarization angle' row found — not a polarization file: {filepath}"
+        )
+    angles = np.array(
+        [float(v) for v in lines[angle_row].split("\t")[1:] if v.strip()],
+        dtype=float,
+    )
+    n_ang = len(angles)
+
+    wl, rows = [], []
+    for l in lines[angle_row + 1:]:
+        parts = [p for p in l.split("\t") if p.strip()]
+        if len(parts) < n_ang + 1:
+            continue
+        try:
+            vals = [float(p) for p in parts[:n_ang + 1]]
+        except ValueError:
+            continue
+        wl.append(vals[0])
+        rows.append(vals[1:])
+    if not wl:
+        raise ValueError(f"No spectrum data found in {filepath}")
+
+    # Header block: everything before the "Wavelength" column-header row.
+    hdr_end = next(
+        (i for i, l in enumerate(lines[:angle_row])
+         if l.lower().startswith("wavelength")), angle_row
+    )
+    header_lines = [l.rstrip() for l in lines[:hdr_end] if l.strip()]
+
+    date_str = header_lines[0].split("\t", 1)[-1].strip() if header_lines else ""
+    try:
+        date = datetime.strptime(date_str, "%A, %B %d, %Y, %I:%M %p")
+    except ValueError:
+        date = None
+
+    int_time_str = "0.500"
+    excitation_power_W = None
+    for l in header_lines:
+        label, _, value = l.partition("\t")
+        label = label.strip().lower()
+        if label.startswith("integration time"):
+            m = re.match(r"([\d.]+)\s*s", value.strip())
+            if m:
+                int_time_str = m.group(1)
+        elif label.startswith("excitation power"):
+            m = re.match(r"([-+\d.eE]+)\s*(nW|uW|µW|mW|W)\b", value.strip())
+            if m:
+                scale = {"nW": 1e-9, "uW": 1e-6, "µW": 1e-6, "mW": 1e-3, "W": 1.0}
+                excitation_power_W = float(m.group(1)) * scale[m.group(2)]
+
+    wl     = np.array(wl, dtype=float)
+    counts = np.array(rows, dtype=float)
+    order  = np.argsort(wl)
+    return {
+        "wl":     wl[order],
+        "counts": counts[order],
+        "angles": angles,
+        "hdr": {
+            "raw_header_lines":   header_lines,
+            "date_str":           date_str,
+            "date":               date,
+            "int_time_str":       int_time_str,
+            "hwp_raw":            [],
+            "excitation_power_W": excitation_power_W,
+        },
+    }
 
 
 def _read_trpl_h5_file(path):
