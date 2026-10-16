@@ -7,7 +7,7 @@
 - **Entry point**: `stitchcraft.py` — builds the `QApplication`, applies the `qt_material` `dark_teal.xml` stylesheet, calls `plotting.apply_pg_theme()`, then shows `StitchApp`.
 - **Main window**: `app.py` — `StitchApp(QMainWindow)`, a `QTabWidget` hosting the tabs below.
 - **Platform**: Windows-only PyQt5 app (no PySide/Qt6 constraint otherwise).
-- **GitHub**: https://github.com/ge23jud/Proc.git
+- **GitHub**: https://github.com/ge23jud/Stitchcraft.git
 - **Dependencies**: pinned in `requirements.txt` (PyQt5, pyqtgraph, numpy, h5py, scipy, pandas, qt-material, opencv-python, Pillow, matplotlib — matplotlib is only needed because `nw_analysis.py` and `pl.py` import it at module level; see the `plotting/` note below). No `pyproject.toml`/`setup.py`.
 
 ## Tabs (`tabs/`)
